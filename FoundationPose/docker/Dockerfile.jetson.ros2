@@ -1,0 +1,45 @@
+ARG BASE_IMAGE=foundationpose-jetson:pt2409
+FROM ${BASE_IMAGE}
+
+ARG ROS_DISTRO=humble
+ARG ROS_APT_MIRROR=http://mirrors.tuna.tsinghua.edu.cn/ros2/ubuntu
+ARG DEBIAN_FRONTEND=noninteractive
+
+USER root
+
+ENV TZ=Asia/Shanghai
+
+COPY ros-archive-keyring.gpg /usr/share/keyrings/ros-archive-keyring.gpg
+
+# Keep ROS in a derived image so the fully validated FoundationPose image
+# remains unchanged. The RealSense driver, rosbag2, and RViz run on the host.
+RUN set -eux; \
+    apt-get update; \
+  apt-get --fix-broken install -y --no-install-recommends; \
+  python3 -c 'import cv2, open3d, scipy, torch; print("FoundationPose imports after APT repair: OK")'; \
+    echo "deb [arch=arm64 signed-by=/usr/share/keyrings/ros-archive-keyring.gpg] ${ROS_APT_MIRROR} jammy main" \
+      > /etc/apt/sources.list.d/ros2.list; \
+    apt-get update; \
+    apt-get install -y --no-install-recommends \
+      ros-${ROS_DISTRO}-ros-core \
+      ros-${ROS_DISTRO}-rclpy \
+      ros-${ROS_DISTRO}-sensor-msgs \
+      ros-${ROS_DISTRO}-geometry-msgs \
+      ros-${ROS_DISTRO}-std-msgs \
+      ros-${ROS_DISTRO}-message-filters \
+      ros-${ROS_DISTRO}-tf2-ros \
+      ros-${ROS_DISTRO}-rmw-fastrtps-cpp; \
+    rm -rf /var/lib/apt/lists/*
+
+COPY ros2_entrypoint.sh /opt/foundationpose/ros2_entrypoint.sh
+RUN chmod 0755 /opt/foundationpose/ros2_entrypoint.sh \
+    && . /opt/ros/${ROS_DISTRO}/setup.sh \
+    && python3 -c 'import geometry_msgs, message_filters, rclpy, sensor_msgs, std_msgs, torch; print("ROS 2/PyTorch imports: OK")'
+
+ENV ROS_DISTRO=humble \
+    ROS_DOMAIN_ID=0 \
+    ROS_LOCALHOST_ONLY=0 \
+    RMW_IMPLEMENTATION=rmw_fastrtps_cpp
+
+ENTRYPOINT ["/opt/foundationpose/ros2_entrypoint.sh"]
+CMD ["bash"]

@@ -1,0 +1,11 @@
+# The image contains dependencies only. Runtime source, weights and outputs are mounted.
+**
+!FoundationPose/
+FoundationPose/**
+!FoundationPose/docker/
+FoundationPose/docker/**
+!FoundationPose/docker/requirements.jetson*.txt
+!FoundationPose/docker/jetson_offline_jp61/
+!FoundationPose/docker/jetson_offline_jp61/**
+!FoundationPose/mycpp/
+!FoundationPose/mycpp/**

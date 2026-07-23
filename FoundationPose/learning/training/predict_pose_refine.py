@@ -162,6 +162,8 @@ class PoseRefinePredictor:
     self.model.load_state_dict(ckpt)
 
     self.model.cuda().eval()
+    self.model.fuse_conv_batchnorm()
+    self.model.to(memory_format=torch.channels_last)
     logging.info("init done")
     self.last_trans_update = None
     self.last_rot_update = None
@@ -209,6 +211,10 @@ class PoseRefinePredictor:
         'transform': 0.0,
         'input_pack': 0.0,
         'network_forward': 0.0,
+        'encodeA': 0.0,
+        'encodeAB': 0.0,
+        'trans_head': 0.0,
+        'rot_head': 0.0,
         'pose_update': 0.0,
         'total': 0.0,
         'other': 0.0,
@@ -221,8 +227,8 @@ class PoseRefinePredictor:
       B_in_cams = []
       for b in range(0, pose_data.rgbAs.shape[0], bs):
         t0 = time.perf_counter()
-        A = torch.cat([pose_data.rgbAs[b:b+bs].cuda(), pose_data.xyz_mapAs[b:b+bs].cuda()], dim=1).float()
-        B = torch.cat([pose_data.rgbBs[b:b+bs].cuda(), pose_data.xyz_mapBs[b:b+bs].cuda()], dim=1).float()
+        A = torch.cat([pose_data.rgbAs[b:b+bs].cuda(), pose_data.xyz_mapAs[b:b+bs].cuda()], dim=1).float().contiguous(memory_format=torch.channels_last)
+        B = torch.cat([pose_data.rgbBs[b:b+bs].cuda(), pose_data.xyz_mapBs[b:b+bs].cuda()], dim=1).float().contiguous(memory_format=torch.channels_last)
         torch.cuda.synchronize()
         timing['input_pack'] += time.perf_counter() - t0
 
@@ -234,6 +240,8 @@ class PoseRefinePredictor:
           output[k] = output[k].float()
         torch.cuda.synchronize()
         timing['network_forward'] += time.perf_counter() - t0
+        for name, elapsed in self.model.collect_last_cuda_timing().items():
+          timing[name] += elapsed
         logging.info("forward done")
 
         t0 = time.perf_counter()

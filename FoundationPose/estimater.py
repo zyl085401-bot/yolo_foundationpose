@@ -357,6 +357,9 @@ class FoundationPose:
     self.last_axis_prior_diagnostics = None
     t_register_start = time.perf_counter()
     set_seed(0)
+    # Registration repeatedly uses fixed 160x160 inputs and stable batch sizes,
+    # so cache cuDNN's fastest deterministic convolution algorithms per shape.
+    torch.backends.cudnn.benchmark = True
     logging.info('Welcome')
 
     if self.glctx is None:
@@ -478,6 +481,7 @@ class FoundationPose:
       t0 = time.perf_counter()
       scores, vis = self.scorer.predict(mesh=self.mesh, rgb=rgb, depth=depth, K=K, ob_in_cams=score_poses.data.cpu().numpy(), normal_map=normal_map, mesh_tensors=self.mesh_tensors, glctx=self.glctx, mesh_diameter=self.diameter, get_vis=False)
       torch.cuda.synchronize()
+      timing['scorer_coarse_detail'] = dict(getattr(self.scorer, 'last_timing', {}))
       if self.last_axis_prior_diagnostics is not None:
         coarse_scores = scores.detach().cpu().numpy() if torch.is_tensor(scores) else np.asarray(scores)
         self.last_axis_prior_diagnostics['coarse_scores'] = np.asarray(coarse_scores, dtype=np.float32).reshape(-1)
@@ -505,11 +509,17 @@ class FoundationPose:
       scores, vis = self.scorer.predict(mesh=self.mesh, rgb=rgb, depth=depth, K=K, ob_in_cams=poses.data.cpu().numpy(), normal_map=normal_map, mesh_tensors=self.mesh_tensors, glctx=self.glctx, mesh_diameter=self.diameter, get_vis=self.debug>=2)
       torch.cuda.synchronize()
       timing['scorer_fine'] = time.perf_counter() - t0
+      timing['scorer_fine_detail'] = dict(getattr(self.scorer, 'last_timing', {}))
       if vis is not None:
         imageio.imwrite(f'{self.debug_dir}/vis_score.png', vis)
 
       timing['refiner'] = timing['refiner_coarse'] + timing['refiner_fine']
       timing['scorer'] = timing['scorer_coarse'] + timing['scorer_fine']
+      scorer_detail_keys = set(timing['scorer_coarse_detail']) | set(timing['scorer_fine_detail'])
+      timing['scorer_detail'] = {
+          key: timing['scorer_coarse_detail'].get(key, 0.0) + timing['scorer_fine_detail'].get(key, 0.0)
+          for key in scorer_detail_keys
+      }
       detail_keys = set(timing['refiner_coarse_detail']) | set(timing['refiner_fine_detail'])
       timing['refiner_detail'] = {
           key: timing['refiner_coarse_detail'].get(key, 0.0) + timing['refiner_fine_detail'].get(key, 0.0)
@@ -530,6 +540,7 @@ class FoundationPose:
       scores, vis = self.scorer.predict(mesh=self.mesh, rgb=rgb, depth=depth, K=K, ob_in_cams=poses.data.cpu().numpy(), normal_map=normal_map, mesh_tensors=self.mesh_tensors, glctx=self.glctx, mesh_diameter=self.diameter, get_vis=self.debug>=2)
       torch.cuda.synchronize()
       timing['scorer'] = time.perf_counter() - t0
+      timing['scorer_detail'] = dict(getattr(self.scorer, 'last_timing', {}))
       if vis is not None:
         imageio.imwrite(f'{self.debug_dir}/vis_score.png', vis)
 

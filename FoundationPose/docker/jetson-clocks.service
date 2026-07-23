@@ -1,0 +1,14 @@
+[Unit]
+Description=Lock NVIDIA Jetson clocks after applying the power model
+Documentation=man:jetson_clocks
+Requires=nvpmodel.service
+After=nvpmodel.service nvfancontrol.service
+ConditionPathExists=/usr/bin/jetson_clocks
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/jetson_clocks
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target

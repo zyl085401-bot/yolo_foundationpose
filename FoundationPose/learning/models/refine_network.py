@@ -27,6 +27,7 @@ class RefineNet(nn.Module):
   def __init__(self, cfg=None, c_in=4, n_view=1):
     super().__init__()
     self.cfg = cfg
+    self._last_timing_events = {}
     if self.cfg.use_BN:
       norm_layer = nn.BatchNorm2d
       norm_layer1d = nn.BatchNorm1d
@@ -70,24 +71,76 @@ class RefineNet(nn.Module):
     )
 
 
+  def fuse_conv_batchnorm(self):
+    """Fold inference BatchNorm2d parameters into their preceding convolutions."""
+    if self.training:
+      raise RuntimeError("Conv-BN fusion requires RefineNet.eval()")
+    if getattr(self, '_conv_bn_fused', False):
+      return self
+
+    from torch.nn.utils.fusion import fuse_conv_bn_eval
+
+    for module in self.modules():
+      if isinstance(module, ConvBNReLU) and len(module.net) >= 2 and isinstance(module.net[1], nn.BatchNorm2d):
+        module.net[0] = fuse_conv_bn_eval(module.net[0], module.net[1])
+        module.net[1] = nn.Identity()
+      elif isinstance(module, ResnetBasicBlock) and module.norm_layer is not None:
+        module.conv1 = fuse_conv_bn_eval(module.conv1, module.bn1)
+        module.bn1 = nn.Identity()
+        module.conv2 = fuse_conv_bn_eval(module.conv2, module.bn2)
+        module.bn2 = nn.Identity()
+        module.norm_layer = None
+
+    self._conv_bn_fused = True
+    return self
+
+
   def forward(self, A, B):
     """
     @A: (B,C,H,W)
     """
     bs = len(A)
     output = {}
+    timing_events = {
+      name: (torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True))
+      for name in ('encodeA', 'encodeAB', 'trans_head', 'rot_head')
+    } if A.is_cuda else {}
 
     x = torch.cat([A,B], dim=0)
+    if timing_events:
+      timing_events['encodeA'][0].record()
     x = self.encodeA(x)
+    if timing_events:
+      timing_events['encodeA'][1].record()
     a = x[:bs]
     b = x[bs:]
 
-    ab = torch.cat((a,b),1).contiguous()
+    ab = torch.cat((a,b),1).contiguous(memory_format=torch.channels_last)
+    if timing_events:
+      timing_events['encodeAB'][0].record()
     ab = self.encodeAB(ab)  #(B,C,H,W)
+    if timing_events:
+      timing_events['encodeAB'][1].record()
 
     ab = self.pos_embed(ab.reshape(bs, ab.shape[1], -1).permute(0,2,1))
 
+    if timing_events:
+      timing_events['trans_head'][0].record()
     output['trans'] = self.trans_head(ab).mean(dim=1)
+    if timing_events:
+      timing_events['trans_head'][1].record()
+      timing_events['rot_head'][0].record()
     output['rot'] = self.rot_head(ab).mean(dim=1)
+    if timing_events:
+      timing_events['rot_head'][1].record()
+    self._last_timing_events = timing_events
 
     return output
+
+
+  def collect_last_cuda_timing(self):
+    """Return synchronized CUDA module timings in seconds."""
+    return {
+      name: start.elapsed_time(end) / 1000.0
+      for name, (start, end) in self._last_timing_events.items()
+    }

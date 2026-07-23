@@ -8,11 +8,11 @@ camera:
   reset_before_start: true
 
 yolo:
-  weights: realtime_foundation/yolo_weights/best.pt
+  weights: realtime_foundation/yolo_weights/best_480x640_trt104.engine
   target_class: null
   target_class_id: 0
   conf: 0.75
-  imgsz: 640
+  imgsz: [480, 640]
   device: cuda:0
   half: true
   min_mask_area: 100
@@ -25,7 +25,7 @@ recording:
   save_register: true
   save_track: true
   require_same_frame_mask: true # tracking 只记录与 RGB-D 同 frame_id 的 mask；调试准确性优先。
-  save_topk_poses: true
+  save_topk_poses: false
   topk_pose_count: 5
   jpeg_quality: 90
 
@@ -44,13 +44,13 @@ foundationpose:
   coarse_score_filter: geometry
   coarse_score_top_k: 6
   fine_refine_iter: 2
-  fine_top_k: 16 # 决定保留几个
+  fine_top_k: 6 # 决定保留几个
 
   axis_prior_enabled: true
   axis_prior_filter: depth_pca
   axis_prior_model_axis: [0.0, 1.0, 0.0]
   axis_prior_max_angle_deg: 60
-  axis_prior_min_candidates: 12
+  axis_prior_min_candidates: 5
   axis_prior_max_candidates: 12
   axis_prior_min_points: 500
   axis_prior_min_confidence: 1.0
@@ -98,7 +98,4 @@ runtime:
   show_window: true
   pose_output: realtime_foundation/outputs/latest_pose.txt
   loop_sleep: 0.0
-
-
-#说真的有一个很大的问题，这些修改会不会影响到后面的追踪环节呢
 

@@ -1,0 +1,7 @@
+# The realtime segmentation checkpoint was trained with Ultralytics 8.4.66
+# (YOLO26 Segment26). Install this late overlay after the validated base stack.
+ultralytics==8.4.66
+ultralytics-thop==2.0.20
+nvidia-ml-py==13.610.43
+polars==1.43.0
+polars-runtime-32==1.43.0

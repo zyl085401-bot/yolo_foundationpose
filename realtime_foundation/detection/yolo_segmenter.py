@@ -30,7 +30,7 @@ class YoloSegmenter:
       target_class: str | None = None,
       target_class_id: int | None = None,
       conf: float = 0.35,
-      imgsz: int = 640,
+      imgsz: int | tuple[int, int] = 640,
       device: str | None = None,
       half: bool = True,
       min_mask_area: int = 100,
@@ -44,11 +44,11 @@ class YoloSegmenter:
           "ultralytics is required for YOLO segmentation. Install it in your environment with: pip install ultralytics"
       ) from exc
 
-    self.model = YOLO(weights)
+    self.model = YOLO(weights, task="segment")
     self.target_class = target_class
     self.target_class_id = target_class_id
     self.conf = conf
-    self.imgsz = imgsz
+    self.imgsz = normalize_imgsz(imgsz)
     self.device = device
     self.half = half
     self.min_mask_area = min_mask_area
@@ -60,9 +60,19 @@ class YoloSegmenter:
     if self.target_class_id is None and self.target_class is not None:
       self.target_class_id = self._class_name_to_id(self.target_class)
 
+    self.morphology_kernel = (
+      np.ones((self.morph_kernel, self.morph_kernel), dtype=np.uint8)
+      if self.morph_kernel > 1
+      else None
+    )
+
   def predict_mask(self, image: np.ndarray) -> YoloMaskResult | None:
     timing = {
         "model_predict": 0.0,
+        "model_preprocess": None,
+        "model_inference": None,
+        "model_postprocess": None,
+        "model_framework_overhead": None,
         "tensor_to_cpu": 0.0,
         "mask_resize_clean": 0.0,
         "select_best_mask": 0.0,
@@ -85,6 +95,19 @@ class YoloSegmenter:
         verbose=False,
     )[0]
     timing["model_predict"] = time.perf_counter() - model_start
+    prediction_speed = getattr(prediction, "speed", {}) or {}
+    model_stage_times = []
+    for stage in ("preprocess", "inference", "postprocess"):
+      stage_ms = prediction_speed.get(stage)
+      if stage_ms is not None:
+        stage_seconds = float(stage_ms) / 1000.0
+        timing[f"model_{stage}"] = stage_seconds
+        model_stage_times.append(stage_seconds)
+    if len(model_stage_times) == 3:
+      timing["model_framework_overhead"] = max(
+          0.0,
+          timing["model_predict"] - sum(model_stage_times),
+      )
 
     if prediction.masks is None or prediction.boxes is None:
       timing["total"] = time.perf_counter() - total_start
@@ -142,13 +165,27 @@ class YoloSegmenter:
   def _resize_and_clean_mask(self, raw_mask: np.ndarray, width: int, height: int) -> np.ndarray:
     import cv2
 
-    mask = cv2.resize(raw_mask.astype(np.float32), (width, height), interpolation=cv2.INTER_LINEAR)
+    mask = np.asarray(raw_mask, dtype=np.float32)
+    mask_height, mask_width = mask.shape[-2:]
+
+    gain = min(mask_width / float(width), mask_height / float(height))
+    pad_width = max(mask_width - width * gain, 0.0) / 2.0
+    pad_height = max(mask_height - height * gain, 0.0) / 2.0
+    left = max(0, int(round(pad_width - 0.1)))
+    right = min(mask_width, int(round(mask_width - pad_width + 0.1)))
+    top = max(0, int(round(pad_height - 0.1)))
+    bottom = min(mask_height, int(round(mask_height - pad_height + 0.1)))
+
+    if right > left and bottom > top:
+      mask = mask[top:bottom, left:right]
+
+    if mask.shape != (height, width):
+      mask = cv2.resize(mask, (width, height), interpolation=cv2.INTER_LINEAR)
     mask = (mask > 0.5).astype(np.uint8)
 
-    if self.morph_kernel > 1:
-      kernel = np.ones((self.morph_kernel, self.morph_kernel), dtype=np.uint8)
-      mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
-      mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
+    if self.morphology_kernel is not None:
+      mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, self.morphology_kernel)
+      mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, self.morphology_kernel)
 
     return mask
 
@@ -165,6 +202,21 @@ class YoloSegmenter:
     return {index: str(name) for index, name in enumerate(names)}
 
 
+def normalize_imgsz(value: Any) -> int | tuple[int, int]:
+  if isinstance(value, (list, tuple)):
+    if len(value) != 2:
+      raise ValueError("imgsz must be an integer or [height, width]")
+    height, width = (int(item) for item in value)
+    if height <= 0 or width <= 0:
+      raise ValueError("imgsz dimensions must be positive")
+    return height, width
+
+  size = int(value)
+  if size <= 0:
+    raise ValueError("imgsz must be positive")
+  return size
+
+
 def parse_args() -> argparse.Namespace:
   parser = argparse.ArgumentParser(description="Test YOLO segmentation mask inference on a single image.")
   parser.add_argument("--config", type=str, default=DEFAULT_CONFIG_FILE, help="Path to YOLO segmentation YAML config.")
@@ -173,7 +225,13 @@ def parse_args() -> argparse.Namespace:
   parser.add_argument("--target-class", type=str, default=None, help="Override target class name from YAML.")
   parser.add_argument("--target-class-id", type=int, default=None, help="Override target class id from YAML.")
   parser.add_argument("--conf", type=float, default=None, help="Override confidence threshold from YAML.")
-  parser.add_argument("--imgsz", type=int, default=None, help="Override inference image size from YAML.")
+  parser.add_argument(
+      "--imgsz",
+      type=int,
+      nargs="+",
+      default=None,
+      help="Override image size with one value or height width, for example --imgsz 480 640.",
+  )
   parser.add_argument("--device", type=str, default=None, help="Override device from YAML, for example cuda:0 or cpu.")
   parser.add_argument("--half", action="store_true", default=None, help="Override YAML and use FP16 inference.")
   parser.add_argument("--no-half", action="store_false", dest="half", help="Override YAML and disable FP16 inference.")
@@ -215,7 +273,7 @@ def build_runtime_config(args: argparse.Namespace) -> dict:
       "target_class": config.get("target_class"),
       "target_class_id": config.get("target_class_id"),
       "conf": float(config.get("conf", 0.35)),
-      "imgsz": int(config.get("imgsz", 640)),
+      "imgsz": normalize_imgsz(config.get("imgsz", 640)),
       "device": config.get("device"),
       "half": bool(config.get("half", True)),
       "min_mask_area": int(config.get("min_mask_area", 100)),
@@ -239,6 +297,8 @@ def build_runtime_config(args: argparse.Namespace) -> dict:
     value = getattr(args, key)
     if value is not None:
       runtime_config[key] = value
+
+  runtime_config["imgsz"] = normalize_imgsz(runtime_config["imgsz"])
 
   runtime_config["image"] = resolve_config_path(runtime_config["image"], config_dir)
   runtime_config["weights"] = resolve_config_path(runtime_config["weights"], config_dir)

@@ -1,0 +1,139 @@
+ARG BASE_IMAGE=nvcr.io/nvidia/pytorch:24.09-py3-igpu
+FROM ${BASE_IMAGE}
+
+ARG MAX_JOBS=1
+
+ENV CUDA_HOME=/usr/local/cuda \
+    PATH=/usr/local/cuda/bin:${PATH} \
+    TORCH_CUDA_ARCH_LIST=8.7 \
+    FORCE_CUDA=1 \
+    MAX_JOBS=${MAX_JOBS} \
+    OPENCV_IO_ENABLE_OPENEXR=1 \
+    PIP_NO_CACHE_DIR=1 \
+    PYTHONUNBUFFERED=1 \
+    PYTHONPATH=/workspace/yolo_foundationpose/FoundationPose:/opt/foundationpose/mycpp-build
+
+# The NX has no external network access. Every package below is copied from
+# the offline bundle prepared on the development PC.
+COPY FoundationPose/docker/jetson_offline_jp61/debs/ /opt/offline/debs/
+RUN set -eu; \
+        runtime_packages='gcc-12-base libatomic1 libbsd0 libc++1-14 libc++abi1-14 \
+            libdrm-amdgpu1 libdrm-common libdrm-nouveau2 libdrm-radeon1 libdrm2 \
+            libedit2 libelf1 libffi8 libgl1-mesa-dri libgl1 libglapi-mesa libglvnd0 \
+            libglx-mesa0 libglx0 libicu70 libllvm15 libmd0 libsensors-config \
+            libsensors5 libtinfo6 libudev1 libunwind-14 libx11-6 libx11-data \
+            libx11-xcb1 libxau6 libxcb-dri2-0 libxcb-dri3-0 libxcb-glx0 \
+            libxcb-present0 libxcb-randr0 libxcb-shm0 libxcb-sync1 libxcb-xfixes0 \
+            libxcb1 libxdmcp6 libxext6 libxfixes3 libxml2 libxshmfence1 \
+            libxxf86vm1 libzstd1 zlib1g'; \
+        build_packages='libeigen3-dev libboost1.74-dev libboost-system1.74.0 \
+            libboost-system1.74-dev libboost-system-dev \
+            libboost-program-options1.74.0 libboost-program-options1.74-dev \
+            libboost-program-options-dev'; \
+        select_deb() { \
+            wanted="$1"; match=''; \
+            for deb in /opt/offline/debs/*.deb; do \
+                package="$(dpkg-deb --field "${deb}" Package)"; \
+                arch="$(dpkg-deb --field "${deb}" Architecture)"; \
+                if [ "${package}" = "${wanted}" ] && { [ "${arch}" = arm64 ] || [ "${arch}" = all ]; }; then \
+                    test -z "${match}" || { echo "Duplicate deb for ${wanted}: ${match}, ${deb}" >&2; return 1; }; \
+                    match="${deb}"; \
+                fi; \
+            done; \
+            test -n "${match}" || { echo "Missing ARM64/all deb: ${wanted}" >&2; return 1; }; \
+            printf '%s' "${match}"; \
+        }; \
+        runtime_debs=''; \
+        for package in ${runtime_packages}; do runtime_debs="${runtime_debs} $(select_deb "${package}")"; done; \
+        dpkg --unpack ${runtime_debs}; \
+        dpkg --configure -a; \
+        for package in ${build_packages}; do \
+            deb="$(select_deb "${package}")"; \
+            dpkg-deb --extract "${deb}" /; \
+        done; \
+        test -f /usr/include/eigen3/Eigen/Core; \
+        test -f /usr/include/boost/program_options.hpp; \
+        test -e /usr/lib/aarch64-linux-gnu/libboost_system.so; \
+        test -e /usr/lib/aarch64-linux-gnu/libboost_program_options.so; \
+        ldconfig
+
+COPY FoundationPose/docker/requirements.jetson.txt /opt/offline/requirements.jetson.txt
+COPY FoundationPose/docker/requirements.jetson.sdist.txt /opt/offline/requirements.jetson.sdist.txt
+COPY FoundationPose/docker/jetson_offline_jp61/wheels/ /opt/offline/wheels/
+
+# --no-deps is intentional: the pinned files list the complete missing runtime
+# set, while the validated NVIDIA base packages must remain untouched.
+RUN python3 -m pip install \
+      --no-index \
+      --find-links=/opt/offline/wheels \
+      --no-deps \
+            --no-build-isolation \
+      -r /opt/offline/requirements.jetson.txt \
+            -r /opt/offline/requirements.jetson.sdist.txt \
+    && python3 - <<'PY'
+import cv2, numpy, scipy, torch, torchvision
+import sys
+assert sys.version_info[:2] == (3, 10), sys.version
+print("Validated NVIDIA base packages were preserved")
+print("torch/torchvision:", torch.__version__, torchvision.__version__)
+print("numpy/scipy/cv2:", numpy.__version__, scipy.__version__, cv2.__version__)
+PY
+
+# The validated Open3D Python 3.10 ARM64 wheel is supplied offline. Its exact
+# Python dependencies are already installed from requirements.jetson.txt.
+RUN python3 -m pip install \
+      --no-index \
+      --find-links=/opt/offline/wheels \
+    --no-deps \
+      'open3d==0.18.0' \
+    && python3 -c 'import open3d; print("Open3D:", open3d.__version__)'
+
+COPY FoundationPose/docker/jetson_offline_jp61/src/pytorch3d.tar.gz /opt/offline/src/pytorch3d.tar.gz
+RUN mkdir -p /opt/src/pytorch3d \
+    && tar -xzf /opt/offline/src/pytorch3d.tar.gz --strip-components=1 -C /opt/src/pytorch3d \
+    && python3 -m pip install --no-index --no-build-isolation --no-deps /opt/src/pytorch3d \
+    && rm -rf /opt/src/pytorch3d
+
+COPY FoundationPose/docker/jetson_offline_jp61/src/nvdiffrast.tar.gz /opt/offline/src/nvdiffrast.tar.gz
+RUN mkdir -p /opt/src/nvdiffrast \
+    && tar -xzf /opt/offline/src/nvdiffrast.tar.gz --strip-components=1 -C /opt/src/nvdiffrast \
+    && python3 -m pip install --no-index --no-build-isolation --no-deps /opt/src/nvdiffrast \
+    && rm -rf /opt/src/nvdiffrast
+
+COPY FoundationPose/mycpp /opt/src/foundationpose-mycpp
+RUN PYBIND11_CMAKE_DIR="$(python3 -m pybind11 --cmakedir)" \
+        && PYTHON_INCLUDE_DIR="$(python3 -c 'import sysconfig; print(sysconfig.get_path("include"))')" \
+        && PYTHON_MODULE_EXTENSION="$(python3 -c 'import sysconfig; print(sysconfig.get_config_var("EXT_SUFFIX"))')" \
+        && test -f "${PYTHON_INCLUDE_DIR}/Python.h" \
+        && test -n "${PYTHON_MODULE_EXTENSION}" \
+    && cmake -S /opt/src/foundationpose-mycpp -B /opt/foundationpose/mycpp-build \
+      -DCMAKE_BUILD_TYPE=Release \
+            -DFOUNDATIONPOSE_PYTHON_INCLUDE_DIR="${PYTHON_INCLUDE_DIR}" \
+            -DFOUNDATIONPOSE_PYTHON_MODULE_EXTENSION="${PYTHON_MODULE_EXTENSION}" \
+      -Dpybind11_DIR="${PYBIND11_CMAKE_DIR}" \
+    && cmake --build /opt/foundationpose/mycpp-build -j"${MAX_JOBS}" \
+    && rm -rf /opt/src/foundationpose-mycpp
+
+RUN python3 - <<'PY'
+import cv2
+import kornia
+import mycpp
+import nvdiffrast.torch
+import numpy
+import open3d
+import pyrealsense2
+import pytorch3d
+import scipy
+import torch
+import torchvision
+import trimesh
+import ultralytics
+import warp
+
+print("Jetson FoundationPose imports: OK")
+print("Python/PyTorch:", torch.__version__, "CUDA", torch.version.cuda)
+print("NumPy/OpenCV/Open3D:", numpy.__version__, cv2.__version__, open3d.__version__)
+PY
+
+WORKDIR /workspace/yolo_foundationpose
+CMD ["bash"]

@@ -1,0 +1,2 @@
+# GUI-enabled ARM64 OpenCV used for the realtime X11 window.
+opencv-python==4.7.0.72

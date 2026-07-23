@@ -1,0 +1,6 @@
+# Pure-Python packages that publish source distributions but no suitable
+# Python 3.10 ARM64 wheel. They are built offline with the base setuptools.
+transformations==2024.6.1
+antlr4-python3-runtime==4.9.3
+fvcore==0.1.5.post20221221
+iopath==0.1.10

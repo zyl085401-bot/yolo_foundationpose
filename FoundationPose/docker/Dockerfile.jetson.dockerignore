@@ -4,7 +4,8 @@
 FoundationPose/**
 !FoundationPose/docker/
 FoundationPose/docker/**
-!FoundationPose/docker/requirements.jetson*.txt
+!FoundationPose/docker/requirements.jetson.txt
+!FoundationPose/docker/requirements.jetson.sdist.txt
 !FoundationPose/docker/jetson_offline_jp61/
 !FoundationPose/docker/jetson_offline_jp61/**
 !FoundationPose/mycpp/

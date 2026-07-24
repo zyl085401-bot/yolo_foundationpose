@@ -32,3 +32,9 @@ FoundationPose/bundlesdf/mycuda/build/
 FoundationPose/demo_data/**/*.zip
 FoundationPose/weights/
 FoundationPose/.git/
+
+# Jetson offline installation bundles / local test artifacts
+FoundationPose/docker/jetson_offline_jp61/
+pytorch-24.09-py3-igpu-arm64.tar
+pytorch-24.09-py3-igpu-arm64.tar.sha256
+realtime_foundation/nx_test.txt

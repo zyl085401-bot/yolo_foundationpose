@@ -195,27 +195,20 @@ def replay_validation_reject_reason(
 
 
 def serializable_foundation_timing(timing: dict) -> dict:
-  result = {
-      key: float(value)
-      for key, value in timing.items()
-      if isinstance(value, (int, float))
-  }
-  result["refiner_detail"] = {
-      key: float(value)
-      for key, value in timing.get("refiner_detail", {}).items()
-      if isinstance(value, (int, float))
-  }
-  for key in (
-      "axis_prior_filter",
-      "axis_prior_status",
-      "axis_prior_model_axis",
-      "axis_prior_eigenvalues",
-      "axis_prior_scene_axis",
-      "coarse_score_filter",
-  ):
-    if key in timing:
-      result[key] = timing[key]
-  return result
+  def convert(value):
+    if isinstance(value, dict):
+      return {str(key): convert(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+      return [convert(item) for item in value]
+    if isinstance(value, np.ndarray):
+      return value.tolist()
+    if isinstance(value, np.generic):
+      return value.item()
+    if isinstance(value, (str, int, float, bool)) or value is None:
+      return value
+    return str(value)
+
+  return convert(timing)
 
 
 def timing_statistics(values: list[float]) -> dict:

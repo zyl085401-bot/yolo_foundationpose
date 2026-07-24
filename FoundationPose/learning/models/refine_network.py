@@ -99,7 +99,7 @@ class RefineNet(nn.Module):
     """
     @A: (B,C,H,W)
     """
-    bs = len(A)
+    bs = A.shape[0]
     output = {}
     timing_events = {
       name: (torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True))

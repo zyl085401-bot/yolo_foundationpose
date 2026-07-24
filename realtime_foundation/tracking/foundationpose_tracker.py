@@ -148,10 +148,20 @@ class FoundationPoseRealtimeTracker:
       axis_prior_visualization_top_n: int = 24,
       axis_prior_visualization_boundary_margin: int = 6,
       axis_prior_visualization_max_records: int = 20,
+      network_input_capture: dict | None = None,
+      render_profile_enabled: bool = False,
+      render_batched_matmul_enabled: bool = False,
+      scorer_precomputed_xyz_enabled: bool = False,
+      refiner_stage1_optimizations_enabled: bool = False,
+      refiner_shared_warp_grid_enabled: bool = False,
+      scorer_shared_warp_grid_enabled: bool = False,
+      scorer_skip_unused_depth_warp_enabled: bool = False,
+      tensorrt_backends: dict | None = None,
       track_refine_iter: int = 2,
       vis_mode: str = "box",
       contour_thickness: int = 3,
       axis_scale: float = 0.1,
+      skip_redundant_coarse_scorer: bool = False,
   ):
     set_logging_format()
     set_seed(0)
@@ -169,6 +179,7 @@ class FoundationPoseRealtimeTracker:
     self.coarse_score_top_k = coarse_score_top_k
     self.fine_refine_iter = fine_refine_iter
     self.fine_top_k = fine_top_k
+    self.skip_redundant_coarse_scorer = skip_redundant_coarse_scorer
     self.axis_prior_filter = axis_prior_filter
     self.axis_prior_model_axis = axis_prior_model_axis
     self.axis_prior_max_angle_deg = axis_prior_max_angle_deg
@@ -201,8 +212,24 @@ class FoundationPoseRealtimeTracker:
     self.extents = np.asarray(self.extents, dtype=np.float32)
     self.bbox = np.stack([-self.extents / 2, self.extents / 2], axis=0).reshape(2, 3).astype(np.float32)
 
-    self.scorer = ScorePredictor()
-    self.refiner = PoseRefinePredictor()
+    tensorrt_backends = dict(tensorrt_backends or {})
+    self.scorer = ScorePredictor(
+      network_input_capture=network_input_capture,
+      tensorrt_backend=tensorrt_backends.get("scorer"),
+      render_profile_enabled=render_profile_enabled,
+      render_batched_matmul_enabled=render_batched_matmul_enabled,
+      scorer_precomputed_xyz_enabled=scorer_precomputed_xyz_enabled,
+      scorer_shared_warp_grid_enabled=scorer_shared_warp_grid_enabled,
+      scorer_skip_unused_depth_warp_enabled=scorer_skip_unused_depth_warp_enabled,
+    )
+    self.refiner = PoseRefinePredictor(
+      network_input_capture=network_input_capture,
+      tensorrt_backend=tensorrt_backends.get("refiner"),
+      render_profile_enabled=render_profile_enabled,
+      render_batched_matmul_enabled=render_batched_matmul_enabled,
+      refiner_stage1_optimizations_enabled=refiner_stage1_optimizations_enabled,
+      refiner_shared_warp_grid_enabled=refiner_shared_warp_grid_enabled,
+    )
     self.glctx = dr.RasterizeCudaContext()
     self.estimator = FoundationPose(
         model_pts=self.mesh.vertices,
@@ -238,6 +265,7 @@ class FoundationPoseRealtimeTracker:
         coarse_score_top_k=self.coarse_score_top_k,
         fine_refine_iter=self.fine_refine_iter,
         fine_top_k=self.fine_top_k,
+        skip_redundant_coarse_scorer=self.skip_redundant_coarse_scorer,
         axis_prior_filter=self.axis_prior_filter,
         axis_prior_model_axis=self.axis_prior_model_axis,
         axis_prior_max_angle_deg=self.axis_prior_max_angle_deg,

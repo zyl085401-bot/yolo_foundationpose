@@ -16,6 +16,29 @@ import yaml
 import time
 
 
+def merge_timing_details(*details):
+  """Merge numeric timings without treating backend metadata or N/A values as seconds."""
+  keys = set().union(*(detail.keys() for detail in details))
+  merged = {}
+  for key in keys:
+    values = [detail.get(key) for detail in details]
+    non_null_values = [value for value in values if value is not None]
+    if key == 'network_backend':
+      unique_values = list(dict.fromkeys(non_null_values))
+      merged[key] = unique_values[0] if len(unique_values) == 1 else 'mixed'
+    elif key == 'fallback_reason':
+      unique_values = list(dict.fromkeys(value for value in non_null_values if value))
+      merged[key] = '; '.join(unique_values) or None
+    elif not non_null_values:
+      merged[key] = None
+    elif all(isinstance(value, (int, float, np.number)) for value in non_null_values):
+      merged[key] = sum(float(value) for value in non_null_values)
+    else:
+      unique_values = list(dict.fromkeys(str(value) for value in non_null_values))
+      merged[key] = unique_values[0] if len(unique_values) == 1 else '; '.join(unique_values)
+  return merged
+
+
 class FoundationPose:
   def __init__(self, model_pts, model_normals, symmetry_tfs=None, mesh=None, scorer:ScorePredictor=None, refiner:PoseRefinePredictor=None, glctx=None, debug=0, debug_dir='/home/bowen/debug/novel_pose_debug/', init_min_n_views=40, init_inplane_step=60):
     self.gt_pose = None
@@ -349,7 +372,7 @@ class FoundationPose:
     }
 
 
-  def register(self, K, rgb, depth, ob_mask, ob_id=None, glctx=None, iteration=5, init_strategy='default', coarse_refine_iter=1, coarse_score_filter='none', coarse_score_top_k=999999, fine_refine_iter=2, fine_top_k=16, axis_prior_filter='none', axis_prior_model_axis=(0,0,1), axis_prior_max_angle_deg=45, axis_prior_min_candidates=12, axis_prior_max_candidates=0, axis_prior_min_points=500, axis_prior_min_confidence=1.4, axis_prior_debug=False):
+  def register(self, K, rgb, depth, ob_mask, ob_id=None, glctx=None, iteration=5, init_strategy='default', coarse_refine_iter=1, coarse_score_filter='none', coarse_score_top_k=999999, fine_refine_iter=2, fine_top_k=16, axis_prior_filter='none', axis_prior_model_axis=(0,0,1), axis_prior_max_angle_deg=45, axis_prior_min_candidates=12, axis_prior_max_candidates=0, axis_prior_min_points=500, axis_prior_min_confidence=1.4, axis_prior_debug=False, skip_redundant_coarse_scorer=False):
     '''Copmute pose from given pts to self.pcd
     @pts: (N,3) np array, downsampled scene points
     '''
@@ -453,10 +476,26 @@ class FoundationPose:
       timing['pose_hypothesis_candidates_after_axis_prior'] = len(poses)
     else:
       timing['axis_prior_status'] = 'disabled'
+
+    refiner_stage1_enabled = getattr(self.refiner, 'refiner_stage1_optimizations_enabled', False)
+    if refiner_stage1_enabled:
+      t0 = time.perf_counter()
+      rgb_cuda = torch.as_tensor(rgb, dtype=torch.float, device='cuda')
+      depth_cuda = torch.as_tensor(depth, dtype=torch.float, device='cuda')
+      xyz_map_cuda = torch.as_tensor(xyz_map, dtype=torch.float, device='cuda')
+      torch.cuda.synchronize()
+      timing['frame_to_cuda'] = time.perf_counter() - t0
+    else:
+      rgb_cuda = rgb
+      depth_cuda = depth
+      xyz_map_cuda = xyz_map
+    scorer_xyz_map = None
+
     if init_strategy == 'topk_two_stage':
       timing['refiner_coarse_candidates'] = int(len(poses))
       t0 = time.perf_counter()
-      poses, vis = self.refiner.predict(mesh=self.mesh, mesh_tensors=self.mesh_tensors, rgb=rgb, depth=depth, K=K, ob_in_cams=poses.data.cpu().numpy(), normal_map=normal_map, xyz_map=xyz_map, glctx=self.glctx, mesh_diameter=self.diameter, iteration=coarse_refine_iter, get_vis=False)
+      refiner_pose_input = poses if refiner_stage1_enabled else poses.data.cpu().numpy()
+      poses, vis = self.refiner.predict(mesh=self.mesh, mesh_tensors=self.mesh_tensors, rgb=rgb_cuda, depth=depth_cuda, K=K, ob_in_cams=refiner_pose_input, normal_map=normal_map, xyz_map=xyz_map_cuda, glctx=self.glctx, mesh_diameter=self.diameter, iteration=coarse_refine_iter, get_vis=False, network_stage='refiner_coarse')
       torch.cuda.synchronize()
       if self.last_axis_prior_diagnostics is not None:
         self.last_axis_prior_diagnostics['poses_after_coarse_refiner'] = poses.detach().cpu().numpy().astype(np.float32)
@@ -477,27 +516,46 @@ class FoundationPose:
       timing['coarse_score_candidates'] = score_k
       timing['scorer_coarse_candidates'] = int(len(score_poses))
       timing['coarse_score_filter'] = coarse_score_filter
-
-      t0 = time.perf_counter()
-      scores, vis = self.scorer.predict(mesh=self.mesh, rgb=rgb, depth=depth, K=K, ob_in_cams=score_poses.data.cpu().numpy(), normal_map=normal_map, mesh_tensors=self.mesh_tensors, glctx=self.glctx, mesh_diameter=self.diameter, get_vis=False)
-      torch.cuda.synchronize()
-      timing['scorer_coarse_detail'] = dict(getattr(self.scorer, 'last_timing', {}))
-      if self.last_axis_prior_diagnostics is not None:
-        coarse_scores = scores.detach().cpu().numpy() if torch.is_tensor(scores) else np.asarray(scores)
-        self.last_axis_prior_diagnostics['coarse_scores'] = np.asarray(coarse_scores, dtype=np.float32).reshape(-1)
-      timing['scorer_coarse'] = time.perf_counter() - t0
-
-      t0 = time.perf_counter()
       top_k = max(1, min(int(fine_top_k), len(poses)))
       top_k = min(top_k, len(score_poses))
-      top_ids = torch.as_tensor(scores).argsort(descending=True)[:top_k]
-      poses = score_poses[top_ids]
+      coarse_scorer_redundant = (
+          bool(skip_redundant_coarse_scorer)
+          and top_k == len(score_poses)
+          and self.last_axis_prior_diagnostics is None
+      )
+
+      if coarse_scorer_redundant:
+        timing['scorer_coarse'] = 0.0
+        timing['scorer_coarse_detail'] = {}
+        timing['coarse_scorer_status'] = 'skipped_redundant_all_candidates_retained'
+      else:
+        t0 = time.perf_counter()
+        if getattr(self.scorer, 'scorer_precomputed_xyz_enabled', False) and scorer_xyz_map is None:
+          scorer_xyz_map = xyz_map_cuda if refiner_stage1_enabled else torch.as_tensor(xyz_map, dtype=torch.float, device='cuda')
+        xyz_map_for_scorer = scorer_xyz_map if scorer_xyz_map is not None else xyz_map
+        scorer_pose_input = score_poses if refiner_stage1_enabled else score_poses.data.cpu().numpy()
+        scores, vis = self.scorer.predict(mesh=self.mesh, rgb=rgb_cuda, depth=depth_cuda, K=K, ob_in_cams=scorer_pose_input, normal_map=normal_map, xyz_map=xyz_map_for_scorer, mesh_tensors=self.mesh_tensors, glctx=self.glctx, mesh_diameter=self.diameter, get_vis=False, network_stage='scorer_coarse')
+        torch.cuda.synchronize()
+        timing['scorer_coarse_detail'] = dict(getattr(self.scorer, 'last_timing', {}))
+        if self.last_axis_prior_diagnostics is not None:
+          coarse_scores = scores.detach().cpu().numpy() if torch.is_tensor(scores) else np.asarray(scores)
+          self.last_axis_prior_diagnostics['coarse_scores'] = np.asarray(coarse_scores, dtype=np.float32).reshape(-1)
+        timing['scorer_coarse'] = time.perf_counter() - t0
+        timing['coarse_scorer_status'] = 'executed'
+
+      t0 = time.perf_counter()
+      if coarse_scorer_redundant:
+        poses = score_poses
+      else:
+        top_ids = torch.as_tensor(scores).argsort(descending=True)[:top_k]
+        poses = score_poses[top_ids]
       torch.cuda.synchronize()
       timing['topk_select'] = time.perf_counter() - t0
 
       timing['refiner_fine_candidates'] = int(len(poses))
       t0 = time.perf_counter()
-      poses, vis = self.refiner.predict(mesh=self.mesh, mesh_tensors=self.mesh_tensors, rgb=rgb, depth=depth, K=K, ob_in_cams=poses.data.cpu().numpy(), normal_map=normal_map, xyz_map=xyz_map, glctx=self.glctx, mesh_diameter=self.diameter, iteration=fine_refine_iter, get_vis=self.debug>=2)
+      refiner_pose_input = poses if refiner_stage1_enabled else poses.data.cpu().numpy()
+      poses, vis = self.refiner.predict(mesh=self.mesh, mesh_tensors=self.mesh_tensors, rgb=rgb_cuda, depth=depth_cuda, K=K, ob_in_cams=refiner_pose_input, normal_map=normal_map, xyz_map=xyz_map_cuda, glctx=self.glctx, mesh_diameter=self.diameter, iteration=fine_refine_iter, get_vis=self.debug>=2, network_stage='refiner_fine')
       torch.cuda.synchronize()
       timing['refiner_fine'] = time.perf_counter() - t0
       timing['refiner_fine_detail'] = dict(getattr(self.refiner, 'last_timing', {}))
@@ -506,7 +564,11 @@ class FoundationPose:
 
       timing['scorer_fine_candidates'] = int(len(poses))
       t0 = time.perf_counter()
-      scores, vis = self.scorer.predict(mesh=self.mesh, rgb=rgb, depth=depth, K=K, ob_in_cams=poses.data.cpu().numpy(), normal_map=normal_map, mesh_tensors=self.mesh_tensors, glctx=self.glctx, mesh_diameter=self.diameter, get_vis=self.debug>=2)
+      if getattr(self.scorer, 'scorer_precomputed_xyz_enabled', False) and scorer_xyz_map is None:
+        scorer_xyz_map = xyz_map_cuda if refiner_stage1_enabled else torch.as_tensor(xyz_map, dtype=torch.float, device='cuda')
+      xyz_map_for_scorer = scorer_xyz_map if scorer_xyz_map is not None else xyz_map
+      scorer_pose_input = poses if refiner_stage1_enabled else poses.data.cpu().numpy()
+      scores, vis = self.scorer.predict(mesh=self.mesh, rgb=rgb_cuda, depth=depth_cuda, K=K, ob_in_cams=scorer_pose_input, normal_map=normal_map, xyz_map=xyz_map_for_scorer, mesh_tensors=self.mesh_tensors, glctx=self.glctx, mesh_diameter=self.diameter, get_vis=self.debug>=2, network_stage='scorer_fine')
       torch.cuda.synchronize()
       timing['scorer_fine'] = time.perf_counter() - t0
       timing['scorer_fine_detail'] = dict(getattr(self.scorer, 'last_timing', {}))
@@ -515,20 +577,13 @@ class FoundationPose:
 
       timing['refiner'] = timing['refiner_coarse'] + timing['refiner_fine']
       timing['scorer'] = timing['scorer_coarse'] + timing['scorer_fine']
-      scorer_detail_keys = set(timing['scorer_coarse_detail']) | set(timing['scorer_fine_detail'])
-      timing['scorer_detail'] = {
-          key: timing['scorer_coarse_detail'].get(key, 0.0) + timing['scorer_fine_detail'].get(key, 0.0)
-          for key in scorer_detail_keys
-      }
-      detail_keys = set(timing['refiner_coarse_detail']) | set(timing['refiner_fine_detail'])
-      timing['refiner_detail'] = {
-          key: timing['refiner_coarse_detail'].get(key, 0.0) + timing['refiner_fine_detail'].get(key, 0.0)
-          for key in detail_keys
-      }
+      timing['scorer_detail'] = merge_timing_details(timing['scorer_coarse_detail'], timing['scorer_fine_detail'])
+      timing['refiner_detail'] = merge_timing_details(timing['refiner_coarse_detail'], timing['refiner_fine_detail'])
     else:
       timing['refiner_candidates'] = int(len(poses))
       t0 = time.perf_counter()
-      poses, vis = self.refiner.predict(mesh=self.mesh, mesh_tensors=self.mesh_tensors, rgb=rgb, depth=depth, K=K, ob_in_cams=poses.data.cpu().numpy(), normal_map=normal_map, xyz_map=xyz_map, glctx=self.glctx, mesh_diameter=self.diameter, iteration=iteration, get_vis=self.debug>=2)
+      refiner_pose_input = poses if refiner_stage1_enabled else poses.data.cpu().numpy()
+      poses, vis = self.refiner.predict(mesh=self.mesh, mesh_tensors=self.mesh_tensors, rgb=rgb_cuda, depth=depth_cuda, K=K, ob_in_cams=refiner_pose_input, normal_map=normal_map, xyz_map=xyz_map_cuda, glctx=self.glctx, mesh_diameter=self.diameter, iteration=iteration, get_vis=self.debug>=2)
       torch.cuda.synchronize()
       timing['refiner'] = time.perf_counter() - t0
       timing['refiner_detail'] = getattr(self.refiner, 'last_timing', {})
@@ -537,7 +592,11 @@ class FoundationPose:
 
       timing['scorer_candidates'] = int(len(poses))
       t0 = time.perf_counter()
-      scores, vis = self.scorer.predict(mesh=self.mesh, rgb=rgb, depth=depth, K=K, ob_in_cams=poses.data.cpu().numpy(), normal_map=normal_map, mesh_tensors=self.mesh_tensors, glctx=self.glctx, mesh_diameter=self.diameter, get_vis=self.debug>=2)
+      if getattr(self.scorer, 'scorer_precomputed_xyz_enabled', False) and scorer_xyz_map is None:
+        scorer_xyz_map = xyz_map_cuda if refiner_stage1_enabled else torch.as_tensor(xyz_map, dtype=torch.float, device='cuda')
+      xyz_map_for_scorer = scorer_xyz_map if scorer_xyz_map is not None else xyz_map
+      scorer_pose_input = poses if refiner_stage1_enabled else poses.data.cpu().numpy()
+      scores, vis = self.scorer.predict(mesh=self.mesh, rgb=rgb_cuda, depth=depth_cuda, K=K, ob_in_cams=scorer_pose_input, normal_map=normal_map, xyz_map=xyz_map_for_scorer, mesh_tensors=self.mesh_tensors, glctx=self.glctx, mesh_diameter=self.diameter, get_vis=self.debug>=2)
       torch.cuda.synchronize()
       timing['scorer'] = time.perf_counter() - t0
       timing['scorer_detail'] = dict(getattr(self.scorer, 'last_timing', {}))
@@ -566,7 +625,7 @@ class FoundationPose:
 
     torch.cuda.synchronize()
     timing['register'] = time.perf_counter() - t_register_start
-    known_time = sum(timing.get(key, 0.0) for key in ('depth_preprocess', 'pose_hypothesis', 'axis_prior', 'refiner', 'coarse_score_select', 'scorer', 'topk_select', 'sort_select'))
+    known_time = sum(timing.get(key, 0.0) for key in ('depth_preprocess', 'pose_hypothesis', 'axis_prior', 'frame_to_cuda', 'refiner', 'coarse_score_select', 'scorer', 'topk_select', 'sort_select'))
     timing['other'] = max(timing['register'] - known_time, 0.0)
     self.last_register_timing = timing
 
@@ -594,7 +653,10 @@ class FoundationPose:
 
     xyz_map = depth2xyzmap_batch(depth[None], torch.as_tensor(K, dtype=torch.float, device='cuda')[None], zfar=np.inf)[0]
 
-    pose, vis = self.refiner.predict(mesh=self.mesh, mesh_tensors=self.mesh_tensors, rgb=rgb, depth=depth, K=K, ob_in_cams=self.pose_last.reshape(1,4,4).data.cpu().numpy(), normal_map=None, xyz_map=xyz_map, mesh_diameter=self.diameter, glctx=self.glctx, iteration=iteration, get_vis=self.debug>=2)
+    track_pose_input = self.pose_last.reshape(1,4,4)
+    if not getattr(self.refiner, 'refiner_stage1_optimizations_enabled', False):
+      track_pose_input = track_pose_input.data.cpu().numpy()
+    pose, vis = self.refiner.predict(mesh=self.mesh, mesh_tensors=self.mesh_tensors, rgb=rgb, depth=depth, K=K, ob_in_cams=track_pose_input, normal_map=None, xyz_map=xyz_map, mesh_diameter=self.diameter, glctx=self.glctx, iteration=iteration, get_vis=self.debug>=2, network_stage='refiner_track')
     torch.cuda.synchronize()
     logging.info("pose done")
     if self.debug>=2:

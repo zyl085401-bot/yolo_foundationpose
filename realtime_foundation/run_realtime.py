@@ -316,6 +316,18 @@ def resolve_path(path: str | None) -> str | None:
   return os.path.abspath(os.path.join(REPO_ROOT, path))
 
 
+def resolve_tensorrt_backends(tracker_cfg: dict) -> dict:
+  backends = dict(tracker_cfg.get("tensorrt", {}))
+  refiner = dict(backends.get("refiner", {}))
+  scorer = dict(backends.get("scorer", {}))
+  refiner["engine_path"] = resolve_path(refiner.get("engine_path"))
+  scorer["engine_paths"] = {
+      int(candidate_count): resolve_path(engine_path)
+      for candidate_count, engine_path in dict(scorer.get("engine_paths", {})).items()
+  }
+  return {"refiner": refiner, "scorer": scorer}
+
+
 def build_tracker(tracker_cfg: dict) -> FoundationPoseRealtimeTracker:
   return FoundationPoseRealtimeTracker(
       mesh_file=resolve_path(tracker_cfg["mesh_file"]),
@@ -331,6 +343,7 @@ def build_tracker(tracker_cfg: dict) -> FoundationPoseRealtimeTracker:
       coarse_score_top_k=int(tracker_cfg.get("coarse_score_top_k", 999999)),
       fine_refine_iter=int(tracker_cfg.get("fine_refine_iter", 2)),
       fine_top_k=int(tracker_cfg.get("fine_top_k", 16)),
+      skip_redundant_coarse_scorer=bool(tracker_cfg.get("skip_redundant_coarse_scorer", False)),
       axis_prior_filter=tracker_cfg.get("axis_prior_filter", "none") if bool(tracker_cfg.get("axis_prior_enabled", False)) else "none",
       axis_prior_model_axis=tuple(float(value) for value in tracker_cfg.get("axis_prior_model_axis", [0.0, 0.0, 1.0])),
       axis_prior_max_angle_deg=float(tracker_cfg.get("axis_prior_max_angle_deg", 45.0)),
@@ -343,6 +356,18 @@ def build_tracker(tracker_cfg: dict) -> FoundationPoseRealtimeTracker:
       axis_prior_visualization_top_n=int(tracker_cfg.get("axis_prior_visualization_top_n", 24)),
       axis_prior_visualization_boundary_margin=int(tracker_cfg.get("axis_prior_visualization_boundary_margin", 6)),
       axis_prior_visualization_max_records=int(tracker_cfg.get("axis_prior_visualization_max_records", 20)),
+      network_input_capture={
+          **dict(tracker_cfg.get("network_input_capture", {})),
+          "output_dir": resolve_path(dict(tracker_cfg.get("network_input_capture", {})).get("output_dir", "realtime_foundation/outputs/network_input_capture")),
+      },
+      render_profile_enabled=bool(tracker_cfg.get("render_profile_enabled", False)),
+      render_batched_matmul_enabled=bool(tracker_cfg.get("render_batched_matmul_enabled", False)),
+      scorer_precomputed_xyz_enabled=bool(tracker_cfg.get("scorer_precomputed_xyz_enabled", False)),
+      refiner_stage1_optimizations_enabled=bool(tracker_cfg.get("refiner_stage1_optimizations_enabled", False)),
+      refiner_shared_warp_grid_enabled=bool(tracker_cfg.get("refiner_shared_warp_grid_enabled", False)),
+      scorer_shared_warp_grid_enabled=bool(tracker_cfg.get("scorer_shared_warp_grid_enabled", False)),
+      scorer_skip_unused_depth_warp_enabled=bool(tracker_cfg.get("scorer_skip_unused_depth_warp_enabled", False)),
+      tensorrt_backends=resolve_tensorrt_backends(tracker_cfg),
       track_refine_iter=int(tracker_cfg.get("track_refine_iter", 2)),
       vis_mode=tracker_cfg.get("vis_mode", "box"),
       contour_thickness=int(tracker_cfg.get("contour_thickness", 3)),
@@ -731,7 +756,7 @@ def seconds_to_ms(value):
   return float(value) * 1000.0
 
 
-def foundation_register_timing_rows(timing: dict, register_wall_time: float | None = None) -> list[tuple[str, float | None]]:
+def foundation_register_timing_rows(timing: dict, register_wall_time: float | None = None) -> list[tuple[str, float | str | None]]:
   refiner_detail = timing.get("refiner_detail", {})
   refiner_coarse_detail = timing.get("refiner_coarse_detail", {})
   refiner_fine_detail = timing.get("refiner_fine_detail", {})
@@ -739,40 +764,81 @@ def foundation_register_timing_rows(timing: dict, register_wall_time: float | No
   scorer_coarse_detail = timing.get("scorer_coarse_detail", {})
   scorer_fine_detail = timing.get("scorer_fine_detail", {})
   register_time = timing.get("register", register_wall_time)
-  return [
+  rows = [
       ("foundation_total", seconds_to_ms(register_time)),
       ("  foundation_depth_preprocess", seconds_to_ms(timing.get("depth_preprocess"))),
       ("  foundation_pose_hypothesis", seconds_to_ms(timing.get("pose_hypothesis"))),
       ("  foundation_axis_prior", seconds_to_ms(timing.get("axis_prior"))),
+      ("  foundation_frame_to_cuda", seconds_to_ms(timing.get("frame_to_cuda"))),
       ("  foundation_refiner", seconds_to_ms(timing.get("refiner"))),
       ("    refiner_coarse", seconds_to_ms(timing.get("refiner_coarse"))),
+      ("      refiner_coarse_backend", refiner_coarse_detail.get("network_backend")),
+      ("      refiner_coarse_fallback", refiner_coarse_detail.get("fallback_reason")),
+      ("      refiner_coarse_crop_window", seconds_to_ms(refiner_coarse_detail.get("crop_window"))),
+      ("      refiner_coarse_render", seconds_to_ms(refiner_coarse_detail.get("render"))),
+      ("      refiner_coarse_render_postprocess", seconds_to_ms(refiner_coarse_detail.get("render_postprocess"))),
+      ("      refiner_coarse_warp", seconds_to_ms(refiner_coarse_detail.get("warp"))),
+      ("      refiner_coarse_transform", seconds_to_ms(refiner_coarse_detail.get("transform"))),
+      ("      refiner_coarse_input_pack", seconds_to_ms(refiner_coarse_detail.get("input_pack"))),
       ("      refiner_coarse_network_forward", seconds_to_ms(refiner_coarse_detail.get("network_forward"))),
+      ("        refiner_coarse_layout_convert", seconds_to_ms(refiner_coarse_detail.get("layout_convert"))),
+      ("        refiner_coarse_dtype_convert", seconds_to_ms(refiner_coarse_detail.get("dtype_convert"))),
+      ("        refiner_coarse_tensorrt_execute", seconds_to_ms(refiner_coarse_detail.get("tensorrt_execute"))),
+      ("        refiner_coarse_output_convert", seconds_to_ms(refiner_coarse_detail.get("output_convert"))),
       ("        refiner_coarse_encodeA", seconds_to_ms(refiner_coarse_detail.get("encodeA"))),
       ("        refiner_coarse_encodeAB", seconds_to_ms(refiner_coarse_detail.get("encodeAB"))),
       ("        refiner_coarse_trans_head", seconds_to_ms(refiner_coarse_detail.get("trans_head"))),
       ("        refiner_coarse_rot_head", seconds_to_ms(refiner_coarse_detail.get("rot_head"))),
+      ("      refiner_coarse_pose_update", seconds_to_ms(refiner_coarse_detail.get("pose_update"))),
+      ("      refiner_coarse_empty_cache", seconds_to_ms(refiner_coarse_detail.get("empty_cache"))),
+      ("      refiner_coarse_other", seconds_to_ms(refiner_coarse_detail.get("other"))),
       ("    refiner_fine", seconds_to_ms(timing.get("refiner_fine"))),
+      ("      refiner_fine_backend", refiner_fine_detail.get("network_backend")),
+      ("      refiner_fine_fallback", refiner_fine_detail.get("fallback_reason")),
+      ("      refiner_fine_crop_window", seconds_to_ms(refiner_fine_detail.get("crop_window"))),
+      ("      refiner_fine_render", seconds_to_ms(refiner_fine_detail.get("render"))),
+      ("      refiner_fine_render_postprocess", seconds_to_ms(refiner_fine_detail.get("render_postprocess"))),
+      ("      refiner_fine_warp", seconds_to_ms(refiner_fine_detail.get("warp"))),
+      ("      refiner_fine_transform", seconds_to_ms(refiner_fine_detail.get("transform"))),
+      ("      refiner_fine_input_pack", seconds_to_ms(refiner_fine_detail.get("input_pack"))),
       ("      refiner_fine_network_forward", seconds_to_ms(refiner_fine_detail.get("network_forward"))),
+      ("        refiner_fine_layout_convert", seconds_to_ms(refiner_fine_detail.get("layout_convert"))),
+      ("        refiner_fine_dtype_convert", seconds_to_ms(refiner_fine_detail.get("dtype_convert"))),
+      ("        refiner_fine_tensorrt_execute", seconds_to_ms(refiner_fine_detail.get("tensorrt_execute"))),
+      ("        refiner_fine_output_convert", seconds_to_ms(refiner_fine_detail.get("output_convert"))),
       ("        refiner_fine_encodeA", seconds_to_ms(refiner_fine_detail.get("encodeA"))),
       ("        refiner_fine_encodeAB", seconds_to_ms(refiner_fine_detail.get("encodeAB"))),
       ("        refiner_fine_trans_head", seconds_to_ms(refiner_fine_detail.get("trans_head"))),
       ("        refiner_fine_rot_head", seconds_to_ms(refiner_fine_detail.get("rot_head"))),
+      ("      refiner_fine_pose_update", seconds_to_ms(refiner_fine_detail.get("pose_update"))),
+      ("      refiner_fine_empty_cache", seconds_to_ms(refiner_fine_detail.get("empty_cache"))),
+      ("      refiner_fine_other", seconds_to_ms(refiner_fine_detail.get("other"))),
       ("    refiner_crop_window", seconds_to_ms(refiner_detail.get("crop_window"))),
       ("    refiner_render", seconds_to_ms(refiner_detail.get("render"))),
       ("    refiner_render_postprocess", seconds_to_ms(refiner_detail.get("render_postprocess"))),
       ("    refiner_warp", seconds_to_ms(refiner_detail.get("warp"))),
       ("    refiner_transform", seconds_to_ms(refiner_detail.get("transform"))),
       ("    refiner_input_pack", seconds_to_ms(refiner_detail.get("input_pack"))),
+      ("    refiner_backend", refiner_detail.get("network_backend")),
+      ("    refiner_fallback", refiner_detail.get("fallback_reason")),
       ("    refiner_network_forward", seconds_to_ms(refiner_detail.get("network_forward"))),
+      ("      refiner_layout_convert", seconds_to_ms(refiner_detail.get("layout_convert"))),
+      ("      refiner_dtype_convert", seconds_to_ms(refiner_detail.get("dtype_convert"))),
+      ("      refiner_tensorrt_execute", seconds_to_ms(refiner_detail.get("tensorrt_execute"))),
+      ("      refiner_output_convert", seconds_to_ms(refiner_detail.get("output_convert"))),
       ("      refiner_encodeA", seconds_to_ms(refiner_detail.get("encodeA"))),
       ("      refiner_encodeAB", seconds_to_ms(refiner_detail.get("encodeAB"))),
       ("      refiner_trans_head", seconds_to_ms(refiner_detail.get("trans_head"))),
       ("      refiner_rot_head", seconds_to_ms(refiner_detail.get("rot_head"))),
+      ("    refiner_empty_cache", seconds_to_ms(refiner_detail.get("empty_cache"))),
       ("    refiner_pose_update", seconds_to_ms(refiner_detail.get("pose_update"))),
       ("    refiner_other", seconds_to_ms(refiner_detail.get("other"))),
       ("  foundation_scorer", seconds_to_ms(timing.get("scorer"))),
       ("    coarse_score_select", seconds_to_ms(timing.get("coarse_score_select"))),
+      ("    coarse_scorer_status", timing.get("coarse_scorer_status")),
       ("    scorer_coarse", seconds_to_ms(timing.get("scorer_coarse"))),
+      ("      scorer_coarse_backend", scorer_coarse_detail.get("network_backend")),
+      ("      scorer_coarse_fallback", scorer_coarse_detail.get("fallback_reason")),
       ("      scorer_coarse_crop_window", seconds_to_ms(scorer_coarse_detail.get("crop_window"))),
       ("      scorer_coarse_render", seconds_to_ms(scorer_coarse_detail.get("render"))),
       ("      scorer_coarse_render_postprocess", seconds_to_ms(scorer_coarse_detail.get("render_postprocess"))),
@@ -780,6 +846,10 @@ def foundation_register_timing_rows(timing: dict, register_wall_time: float | No
       ("      scorer_coarse_transform", seconds_to_ms(scorer_coarse_detail.get("transform"))),
       ("      scorer_coarse_input_pack", seconds_to_ms(scorer_coarse_detail.get("input_pack"))),
       ("      scorer_coarse_network_forward", seconds_to_ms(scorer_coarse_detail.get("network_forward"))),
+      ("        scorer_coarse_layout_convert", seconds_to_ms(scorer_coarse_detail.get("layout_convert"))),
+      ("        scorer_coarse_dtype_convert", seconds_to_ms(scorer_coarse_detail.get("dtype_convert"))),
+      ("        scorer_coarse_tensorrt_execute", seconds_to_ms(scorer_coarse_detail.get("tensorrt_execute"))),
+      ("        scorer_coarse_output_convert", seconds_to_ms(scorer_coarse_detail.get("output_convert"))),
       ("        scorer_coarse_encoderA", seconds_to_ms(scorer_coarse_detail.get("encoderA"))),
       ("        scorer_coarse_encoderAB", seconds_to_ms(scorer_coarse_detail.get("encoderAB"))),
       ("        scorer_coarse_self_attention", seconds_to_ms(scorer_coarse_detail.get("self_attention"))),
@@ -789,6 +859,8 @@ def foundation_register_timing_rows(timing: dict, register_wall_time: float | No
       ("      scorer_coarse_other", seconds_to_ms(scorer_coarse_detail.get("other"))),
       ("      scorer_coarse_detail_total", seconds_to_ms(scorer_coarse_detail.get("total"))),
       ("    scorer_fine", seconds_to_ms(timing.get("scorer_fine"))),
+      ("      scorer_fine_backend", scorer_fine_detail.get("network_backend")),
+      ("      scorer_fine_fallback", scorer_fine_detail.get("fallback_reason")),
       ("      scorer_fine_crop_window", seconds_to_ms(scorer_fine_detail.get("crop_window"))),
       ("      scorer_fine_render", seconds_to_ms(scorer_fine_detail.get("render"))),
       ("      scorer_fine_render_postprocess", seconds_to_ms(scorer_fine_detail.get("render_postprocess"))),
@@ -796,6 +868,10 @@ def foundation_register_timing_rows(timing: dict, register_wall_time: float | No
       ("      scorer_fine_transform", seconds_to_ms(scorer_fine_detail.get("transform"))),
       ("      scorer_fine_input_pack", seconds_to_ms(scorer_fine_detail.get("input_pack"))),
       ("      scorer_fine_network_forward", seconds_to_ms(scorer_fine_detail.get("network_forward"))),
+      ("        scorer_fine_layout_convert", seconds_to_ms(scorer_fine_detail.get("layout_convert"))),
+      ("        scorer_fine_dtype_convert", seconds_to_ms(scorer_fine_detail.get("dtype_convert"))),
+      ("        scorer_fine_tensorrt_execute", seconds_to_ms(scorer_fine_detail.get("tensorrt_execute"))),
+      ("        scorer_fine_output_convert", seconds_to_ms(scorer_fine_detail.get("output_convert"))),
       ("        scorer_fine_encoderA", seconds_to_ms(scorer_fine_detail.get("encoderA"))),
       ("        scorer_fine_encoderAB", seconds_to_ms(scorer_fine_detail.get("encoderAB"))),
       ("        scorer_fine_self_attention", seconds_to_ms(scorer_fine_detail.get("self_attention"))),
@@ -810,7 +886,13 @@ def foundation_register_timing_rows(timing: dict, register_wall_time: float | No
       ("    scorer_warp", seconds_to_ms(scorer_detail.get("warp"))),
       ("    scorer_transform", seconds_to_ms(scorer_detail.get("transform"))),
       ("    scorer_input_pack", seconds_to_ms(scorer_detail.get("input_pack"))),
+      ("    scorer_backend", scorer_detail.get("network_backend")),
+      ("    scorer_fallback", scorer_detail.get("fallback_reason")),
       ("    scorer_network_forward", seconds_to_ms(scorer_detail.get("network_forward"))),
+      ("      scorer_layout_convert", seconds_to_ms(scorer_detail.get("layout_convert"))),
+      ("      scorer_dtype_convert", seconds_to_ms(scorer_detail.get("dtype_convert"))),
+      ("      scorer_tensorrt_execute", seconds_to_ms(scorer_detail.get("tensorrt_execute"))),
+      ("      scorer_output_convert", seconds_to_ms(scorer_detail.get("output_convert"))),
       ("      scorer_encoderA", seconds_to_ms(scorer_detail.get("encoderA"))),
       ("      scorer_encoderAB", seconds_to_ms(scorer_detail.get("encoderAB"))),
       ("      scorer_self_attention", seconds_to_ms(scorer_detail.get("self_attention"))),
@@ -824,12 +906,129 @@ def foundation_register_timing_rows(timing: dict, register_wall_time: float | No
       ("  foundation_other", seconds_to_ms(timing.get("other"))),
   ]
 
+  detail_by_prefix = {
+      "refiner_coarse": refiner_coarse_detail,
+      "refiner_fine": refiner_fine_detail,
+      "scorer_coarse": scorer_coarse_detail,
+      "scorer_fine": scorer_fine_detail,
+      "refiner": refiner_detail,
+      "scorer": scorer_detail,
+  }
+  network_detail_suffixes = {
+      "layout_convert",
+      "dtype_convert",
+      "tensorrt_execute",
+      "output_convert",
+      "encodeA",
+      "encodeAB",
+      "trans_head",
+      "rot_head",
+      "encoderA",
+      "encoderAB",
+      "self_attention",
+      "cross_attention",
+      "linear",
+  }
+  render_profile_keys = (
+      "render_context_mesh_check",
+      "render_projection_setup",
+      "render_vertex_camera_transform",
+      "render_vertex_homogeneous",
+      "render_vertex_clip_transform",
+      "render_bbox_transform",
+      "render_rasterize",
+      "render_xyz_depth_interpolate",
+      "render_texture_sample",
+      "render_normal_transform",
+      "render_normal_interpolate",
+      "render_normal_normalize_flip",
+      "render_diffuse_vertex",
+      "render_diffuse_interpolate",
+      "render_lighting_blend",
+      "render_finalize_flip_mask",
+      "render_profile_other",
+  )
+  render_profile_prefixes = {
+      "refiner_coarse",
+      "refiner_fine",
+      "scorer_coarse",
+      "scorer_fine",
+  }
+  transform_profile_keys = (
+      "transform_xyzB_precomputed_warp_crop",
+      "transform_batch_setup",
+      "transform_rgb_normalize",
+      "transform_xyzA_normalize_mask",
+      "transform_xyzB_unwarp_depth",
+      "transform_xyzB_depth_to_xyz",
+      "transform_xyzB_warp_crop",
+      "transform_xyzB_normalize_mask",
+      "transform_profile_other",
+  )
+  transform_profile_prefixes = {
+      "scorer_coarse",
+      "scorer_fine",
+  }
+  filtered_rows = []
+  for stage, value in rows:
+    normalized_stage = stage.strip()
+    matched_prefix = next(
+        (
+            prefix
+            for prefix in detail_by_prefix
+            if normalized_stage.startswith(f"{prefix}_")
+        ),
+        None,
+    )
+    if matched_prefix is not None:
+      suffix = normalized_stage[len(matched_prefix) + 1:]
+      detail = detail_by_prefix[matched_prefix]
+      backend = detail.get("network_backend")
+      if suffix == "backend":
+        continue
+      if suffix == "fallback" and not value:
+        continue
+      if suffix == "render" and matched_prefix in render_profile_prefixes:
+        if value is not None:
+          filtered_rows.append((stage, value))
+        child_indent = stage[:len(stage) - len(stage.lstrip())] + "  "
+        for profile_key in render_profile_keys:
+          profile_value = seconds_to_ms(detail.get(profile_key))
+          if profile_value is not None:
+            filtered_rows.append(
+                (f"{child_indent}{matched_prefix}_{profile_key}", profile_value)
+            )
+        continue
+      if suffix == "transform" and matched_prefix in transform_profile_prefixes:
+        if value is not None:
+          filtered_rows.append((stage, value))
+        child_indent = stage[:len(stage) - len(stage.lstrip())] + "  "
+        for profile_key in transform_profile_keys:
+          profile_value = seconds_to_ms(detail.get(profile_key))
+          if profile_value is not None:
+            filtered_rows.append(
+                (f"{child_indent}{matched_prefix}_{profile_key}", profile_value)
+            )
+        continue
+      if backend == "tensorrt":
+        if suffix == "network_forward":
+          output_convert_ms = seconds_to_ms(detail.get("output_convert")) or 0.0
+          value = (value or 0.0) + output_convert_ms
+          stage = stage.replace(
+              f"{matched_prefix}_network_forward",
+              f"{matched_prefix}_network_total(T)",
+          )
+        elif suffix in network_detail_suffixes:
+          continue
+    if value is not None:
+      filtered_rows.append((stage, value))
+  return filtered_rows
+
 
 def foundation_candidate_stage_rows(timing: dict) -> list[tuple[str, int | None, float | None]]:
   if "refiner_coarse_candidates" in timing:
     return [
         ("pose_hypothesis_generated", timing.get("pose_hypothesis_candidates"), timing.get("pose_hypothesis")),
-        ("axis_prior_before", timing.get("axis_prior_candidates_before"), None),
         ("axis_prior_after", timing.get("axis_prior_candidates_after"), timing.get("axis_prior")),
         ("refiner_coarse_input", timing.get("refiner_coarse_candidates"), timing.get("refiner_coarse")),
         ("scorer_coarse_input", timing.get("scorer_coarse_candidates"), timing.get("scorer_coarse")),
@@ -838,7 +1037,6 @@ def foundation_candidate_stage_rows(timing: dict) -> list[tuple[str, int | None,
     ]
   return [
       ("pose_hypothesis_generated", timing.get("pose_hypothesis_candidates"), timing.get("pose_hypothesis")),
-      ("axis_prior_before", timing.get("axis_prior_candidates_before"), None),
       ("axis_prior_after", timing.get("axis_prior_candidates_after"), timing.get("axis_prior")),
       ("refiner_input", timing.get("refiner_candidates"), timing.get("refiner")),
       ("scorer_input", timing.get("scorer_candidates"), timing.get("scorer")),
@@ -889,6 +1087,8 @@ def print_foundation_candidate_summary(init_index: int, timing: dict) -> None:
   for stage, count, seconds in foundation_candidate_stage_rows(timing):
     normalized_count = None if count is None else int(count)
     total_ms = seconds_to_ms(seconds)
+    if normalized_count is None or total_ms is None:
+      continue
     per_candidate_ms = None
     if total_ms is not None and normalized_count is not None and normalized_count > 0:
       per_candidate_ms = total_ms / normalized_count
@@ -903,8 +1103,8 @@ def print_foundation_candidate_summary(init_index: int, timing: dict) -> None:
     )
 
 
-def print_timing_summary(init_index: int, rows: list[tuple[str, float | None]]) -> None:
-  stage_width = 44
+def print_timing_summary(init_index: int, rows: list[tuple[str, float | str | None]]) -> None:
+  stage_width = 58 if any("_render_context_mesh_check" in stage for stage, _ in rows) else 44
   value_width = 12
   line_width = stage_width + value_width + 1
   print(f"[TIMER][SUMMARY][foundationpose_init] init={init_index} unit=ms")
@@ -917,7 +1117,12 @@ def print_timing_summary(init_index: int, rows: list[tuple[str, float | None]]) 
     if set(stage) == {"-"}:
       print(stage)
       continue
-    value_text = "N/A" if value is None else f"{float(value):.3f}"
+    if value is None:
+      continue
+    if isinstance(value, str):
+      value_text = value
+    else:
+      value_text = f"{float(value):.3f}"
     print(f"{stage:<{stage_width}}{value_text:>{value_width}}")
 
 

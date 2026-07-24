@@ -45,6 +45,8 @@ foundationpose:
   coarse_score_top_k: 6
   fine_refine_iter: 2
   fine_top_k: 6 # 决定保留几个
+  # 当Coarse Scorer不会删除任何候选时跳过该阶段；仅改变候选顺序，人工A/B确认前保持关闭。
+  skip_redundant_coarse_scorer: true
 
   axis_prior_enabled: true
   axis_prior_filter: depth_pca
@@ -54,6 +56,46 @@ foundationpose:
   axis_prior_max_candidates: 12
   axis_prior_min_points: 500
   axis_prior_min_confidence: 1.0
+
+  # 仅用于TensorRT转换前采集真实A/B与PyTorch参考输出；采集会同步GPU到CPU并增加耗时。
+  network_input_capture:
+    enabled: false
+    output_dir: realtime_foundation/outputs/network_input_capture
+    max_samples_per_signature: 1
+
+  # 仅用于拆分nvdiffrast渲染内部耗时；会增加CUDA Event和同步开销，正常运行保持关闭。
+  render_profile_enabled: false
+
+  # 实验性无损优化：将三处逐顶点广播矩阵乘法改为批量矩阵乘法；人工A/B确认前保持关闭。
+  render_batched_matmul_enabled: true
+
+  # 实验性Scorer优化：复用FoundationPose已有全图XYZ并直接Warp到Crop；人工A/B确认前保持关闭。
+  scorer_precomputed_xyz_enabled: true
+
+  # Refiner阶段一优化：复用GPU帧/Pose、TensorRT直用NCHW、CUDA Event计时及逆矩阵复用；人工A/B确认前保持关闭。
+  refiner_stage1_optimizations_enabled: true
+
+  # Warp阶段二实验：分别控制Refiner/Scorer共享采样Grid，以及Scorer在预计算XYZ路径跳过未使用的Depth Warp。
+  refiner_shared_warp_grid_enabled: true
+  scorer_shared_warp_grid_enabled: true
+  scorer_skip_unused_depth_warp_enabled: true
+
+  # Scorer TensorRT已通过300次真实帧回放；Refiner FP16会放大候选分支敏感性，保持PyTorch。
+  # 可用FOUNDATIONPOSE_REFINER_TENSORRT和FOUNDATIONPOSE_SCORER_TENSORRT单独覆盖。
+  # 任何加载、shape或执行异常都会自动回退PyTorch。
+  tensorrt:
+    refiner:
+      enabled: true
+      engine_path: realtime_foundation/outputs/tensorrt_probe/refiner_n5_12_fp16_trt104.engine
+      min_candidates: 5
+      max_candidates: 12
+      stages: [refiner_coarse, refiner_fine]  # refiner_track固定使用PyTorch。
+    scorer:
+      enabled: true
+      # Scorer候选维参与Cross Attention，不能padding；N=5和N=6使用独立固定shape引擎。
+      engine_paths:
+        5: realtime_foundation/outputs/tensorrt_probe/scorer_n5_fp16_attn_fp32_trt104.engine
+        6: realtime_foundation/outputs/tensorrt_probe/scorer_n6_fp16_attn_fp32_trt104.engine
 
   # 轴先验候选诊断：开启后保存过滤前、截断边界和最终保留候选的联系图。
   # 仅用于初始化调参，会增加额外渲染和图片写入耗时；不会在 tracking 阶段执行。

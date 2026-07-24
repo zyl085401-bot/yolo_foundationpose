@@ -58,6 +58,43 @@ try:
 except:
   wp = None
 enable_timer = 0
+_warp_perspective_base_grid_cache = {}
+
+
+def build_warp_perspective_grid(src, transform, dsize):
+  """Build the exact sampling grid used by Kornia 0.7.x warp_perspective."""
+  if kornia is None:
+    raise RuntimeError('kornia is required to build a perspective warp grid')
+  batch_size, _, src_height, src_width = src.shape
+  dst_height, dst_width = dsize
+  dst_norm_from_src_norm = kornia.geometry.conversions.normalize_homography(
+      transform,
+      (src_height, src_width),
+      (dst_height, dst_width),
+  )
+  src_norm_from_dst_norm = torch.inverse(dst_norm_from_src_norm)
+  cache_key = (src.device, src.dtype, int(dst_height), int(dst_width))
+  base_grid = _warp_perspective_base_grid_cache.get(cache_key)
+  if base_grid is None:
+    base_grid = kornia.utils.create_meshgrid(
+        dst_height,
+        dst_width,
+        normalized_coordinates=True,
+        device=src.device,
+    ).to(src.dtype)
+    _warp_perspective_base_grid_cache[cache_key] = base_grid
+  grid = base_grid.expand(batch_size, dst_height, dst_width, 2)
+  return kornia.geometry.linalg.transform_points(src_norm_from_dst_norm[:,None,None], grid)
+
+
+def warp_perspective_from_grid(src, grid, mode):
+  return F.grid_sample(
+      src,
+      grid,
+      mode=mode,
+      padding_mode='zeros',
+      align_corners=False,
+  )
 
 def NestDict():
   return defaultdict(NestDict)
@@ -132,7 +169,7 @@ def make_mesh_tensors(mesh, device='cuda', max_tex_size=None):
   return mesh_tensors
 
 
-def nvdiffrast_render(K=None, H=None, W=None, ob_in_cams=None, glctx=None, context='cuda', get_normal=False, mesh_tensors=None, mesh=None, projection_mat=None, bbox2d=None, output_size=None, use_light=False, light_color=None, light_dir=np.array([0,0,1]), light_pos=np.array([0,0,0]), w_ambient=0.8, w_diffuse=0.5, extra={}):
+def nvdiffrast_render(K=None, H=None, W=None, ob_in_cams=None, glctx=None, context='cuda', get_normal=False, mesh_tensors=None, mesh=None, projection_mat=None, bbox2d=None, output_size=None, use_light=False, light_color=None, light_dir=np.array([0,0,1]), light_pos=np.array([0,0,0]), w_ambient=0.8, w_diffuse=0.5, extra={}, render_timing=None, batched_matmul_enabled=False):
   '''Just plain rendering, not support any gradient
   @K: (3,3) np array
   @ob_in_cams: (N,4,4) torch tensor, openCV camera
@@ -142,6 +179,7 @@ def nvdiffrast_render(K=None, H=None, W=None, ob_in_cams=None, glctx=None, conte
   @light_dir: in cam space
   @light_pos: in cam space
   '''
+  profile_context_start = time.perf_counter()
   if glctx is None:
     if context == 'gl':
       glctx = dr.RasterizeGLContext()
@@ -158,18 +196,42 @@ def nvdiffrast_render(K=None, H=None, W=None, ob_in_cams=None, glctx=None, conte
   pos_idx = mesh_tensors['faces']
   has_tex = 'tex' in mesh_tensors
 
+  profile_events = []
+  if render_timing is not None:
+    render_timing['render_context_mesh_check'] = render_timing.get('render_context_mesh_check', 0.0) + time.perf_counter() - profile_context_start
+
+    def record_profile_event(name):
+      event = torch.cuda.Event(enable_timing=True)
+      event.record()
+      profile_events.append((name, event))
+
+    record_profile_event(None)
+  else:
+    def record_profile_event(name):
+      return None
+
   ob_in_glcams = torch.tensor(glcam_in_cvcam, device='cuda', dtype=torch.float)[None]@ob_in_cams
   if projection_mat is None:
     projection_mat = projection_matrix_from_intrinsics(K, height=H, width=W, znear=0.001, zfar=100)
   projection_mat = torch.as_tensor(projection_mat.reshape(-1,4,4), device='cuda', dtype=torch.float)
   mtx = projection_mat@ob_in_glcams
+  record_profile_event('render_projection_setup')
 
   if output_size is None:
     output_size = np.asarray([H,W])
 
-  pts_cam = transform_pts(pos, ob_in_cams)
+  if batched_matmul_enabled:
+    pts_cam = torch.matmul(pos, ob_in_cams[...,:3,:3].transpose(-1,-2)) + ob_in_cams[...,None,:3,3]
+  else:
+    pts_cam = transform_pts(pos, ob_in_cams)
+  record_profile_event('render_vertex_camera_transform')
   pos_homo = to_homo_torch(pos)
-  pos_clip = (mtx[:,None]@pos_homo[None,...,None])[...,0]
+  record_profile_event('render_vertex_homogeneous')
+  if batched_matmul_enabled:
+    pos_clip = torch.matmul(pos_homo, mtx.transpose(-1,-2))
+  else:
+    pos_clip = (mtx[:,None]@pos_homo[None,...,None])[...,0]
+  record_profile_event('render_vertex_clip_transform')
   if bbox2d is not None:
     l = bbox2d[:,0]
     t = H-bbox2d[:,1]
@@ -181,22 +243,32 @@ def nvdiffrast_render(K=None, H=None, W=None, ob_in_cams=None, glctx=None, conte
     tf[:,3,0] = (W-r-l)/(r-l)
     tf[:,3,1] = (H-t-b)/(t-b)
     pos_clip = pos_clip@tf
+  record_profile_event('render_bbox_transform')
   rast_out, _ = dr.rasterize(glctx, pos_clip, pos_idx, resolution=np.asarray(output_size))
+  record_profile_event('render_rasterize')
   xyz_map, _ = dr.interpolate(pts_cam, rast_out, pos_idx)
   depth = xyz_map[...,2]
+  record_profile_event('render_xyz_depth_interpolate')
   if has_tex:
     texc, _ = dr.interpolate(mesh_tensors['uv'], rast_out, mesh_tensors['uv_idx'])
     color = dr.texture(mesh_tensors['tex'], texc, filter_mode='linear')
   else:
     color, _ = dr.interpolate(mesh_tensors['vertex_color'], rast_out, pos_idx)
+  record_profile_event('render_texture_sample')
 
   if use_light:
     get_normal = True
   if get_normal:
-    vnormals_cam = transform_dirs(vnormals, ob_in_cams)
+    if batched_matmul_enabled:
+      vnormals_cam = torch.matmul(vnormals, ob_in_cams[...,:3,:3].transpose(-1,-2))
+    else:
+      vnormals_cam = transform_dirs(vnormals, ob_in_cams)
+    record_profile_event('render_normal_transform')
     normal_map, _ = dr.interpolate(vnormals_cam, rast_out, pos_idx)
+    record_profile_event('render_normal_interpolate')
     normal_map = F.normalize(normal_map, dim=-1)
     normal_map = torch.flip(normal_map, dims=[1])
+    record_profile_event('render_normal_normalize_flip')
   else:
     normal_map = None
 
@@ -206,19 +278,33 @@ def nvdiffrast_render(K=None, H=None, W=None, ob_in_cams=None, glctx=None, conte
     else:
       light_dir_neg = torch.as_tensor(light_pos, dtype=torch.float, device='cuda').reshape(1,1,3) - pts_cam
     diffuse_intensity = (F.normalize(vnormals_cam, dim=-1) * F.normalize(light_dir_neg, dim=-1)).sum(dim=-1).clip(0, 1)[...,None]
+    record_profile_event('render_diffuse_vertex')
     diffuse_intensity_map, _ = dr.interpolate(diffuse_intensity, rast_out, pos_idx)  # (N_pose, H, W, 1)
+    record_profile_event('render_diffuse_interpolate')
     if light_color is None:
       light_color = color
     else:
       light_color = torch.as_tensor(light_color, device='cuda', dtype=torch.float)
     color = color*w_ambient + diffuse_intensity_map*light_color*w_diffuse
+    record_profile_event('render_lighting_blend')
 
   color = color.clip(0,1)
   color = color * torch.clamp(rast_out[..., -1:], 0, 1) # Mask out background using alpha
   color = torch.flip(color, dims=[1])   # Flip Y coordinates
   depth = torch.flip(depth, dims=[1])
   extra['xyz_map'] = torch.flip(xyz_map, dims=[1])
+  record_profile_event('render_finalize_flip_mask')
+  if render_timing is not None:
+    render_timing.setdefault('_render_profile_event_groups', []).append(profile_events)
   return color, depth, normal_map
+
+
+def finalize_nvdiffrast_render_timing(render_timing):
+  for profile_events in render_timing.pop('_render_profile_event_groups', []):
+    previous_event = profile_events[0][1]
+    for name, event in profile_events[1:]:
+      render_timing[name] = render_timing.get(name, 0.0) + previous_event.elapsed_time(event) / 1000.0
+      previous_event = event
 
 
 def set_seed(random_seed):

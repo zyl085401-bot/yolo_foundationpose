@@ -46,7 +46,6 @@ REQUIRED_OFFLINE_FILES=(
   "${OFFLINE_DIR}/yolo26/nvidia_ml_py-13.610.43-py3-none-any.whl"
   "${OFFLINE_DIR}/yolo26/polars-1.43.0-py3-none-any.whl"
   "${OFFLINE_DIR}/yolo26/polars_runtime_32-1.43.0-cp310-abi3-manylinux_2_17_aarch64.manylinux2014_aarch64.whl"
-  "${OFFLINE_DIR}/gui/opencv_python-4.7.0.72-cp37-abi3-manylinux_2_17_aarch64.manylinux2014_aarch64.whl"
 )
 for required_file in "${REQUIRED_OFFLINE_FILES[@]}"; do
   if [[ ! -s "${required_file}" ]]; then
@@ -102,21 +101,6 @@ for wanted in "${REQUIRED_DEB_PACKAGES[@]}"; do
   fi
 done
 
-for wanted in x11-common libice6 libsm6; do
-  matches=0
-  while IFS= read -r -d '' deb; do
-    package="$(dpkg-deb --field "${deb}" Package)"
-    arch="$(dpkg-deb --field "${deb}" Architecture)"
-    if [[ "${package}" == "${wanted}" && ( "${arch}" == "arm64" || "${arch}" == "all" ) ]]; then
-      ((matches += 1))
-    fi
-  done < <(find "${OFFLINE_DIR}/gui/debs" -maxdepth 1 -type f -name '*.deb' -print0)
-  if (( matches != 1 )); then
-    echo "ERROR: Expected one ARM64/all GUI deb for ${wanted}, found ${matches}." >&2
-    exit 1
-  fi
-done
-
 if [[ -s "${OFFLINE_DIR}/SHA256SUMS" ]]; then
   echo "Verifying offline bundle checksums..."
   (cd "${OFFLINE_DIR}" && sha256sum --check --quiet SHA256SUMS)
@@ -147,7 +131,6 @@ tar --create --file - --directory "${REPO_ROOT}" \
   FoundationPose/docker/requirements.jetson.txt \
   FoundationPose/docker/requirements.jetson.sdist.txt \
   FoundationPose/docker/requirements.jetson.yolo26.txt \
-  FoundationPose/docker/requirements.jetson.gui.txt \
   FoundationPose/docker/jetson_offline_jp61 \
   FoundationPose/mycpp \
 | "${DOCKER[@]}" build \

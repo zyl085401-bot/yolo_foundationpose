@@ -58,6 +58,30 @@ class ScoreNetMultiPair(nn.Module):
     self.linear = nn.Linear(embed_dim, 1)
 
 
+  def fuse_conv_batchnorm(self):
+    """Fold inference BatchNorm2d parameters into their preceding convolutions."""
+    if self.training:
+      raise RuntimeError("Conv-BN fusion requires ScoreNetMultiPair.eval()")
+    if getattr(self, '_conv_bn_fused', False):
+      return self
+
+    from torch.nn.utils.fusion import fuse_conv_bn_eval
+
+    for module in self.modules():
+      if isinstance(module, ConvBNReLU) and len(module.net) >= 2 and isinstance(module.net[1], nn.BatchNorm2d):
+        module.net[0] = fuse_conv_bn_eval(module.net[0], module.net[1])
+        module.net[1] = nn.Identity()
+      elif isinstance(module, ResnetBasicBlock) and module.norm_layer is not None:
+        module.conv1 = fuse_conv_bn_eval(module.conv1, module.bn1)
+        module.bn1 = nn.Identity()
+        module.conv2 = fuse_conv_bn_eval(module.conv2, module.bn2)
+        module.bn2 = nn.Identity()
+        module.norm_layer = None
+
+    self._conv_bn_fused = True
+    return self
+
+
   def extract_feat(self, A, B, timing_events=None):
     """
     @A: (B*L,C,H,W) L is num of pairs
@@ -72,7 +96,7 @@ class ScoreNetMultiPair(nn.Module):
       timing_events['encoderA'][1].record()
     a = x[:bs]
     b = x[bs:]
-    ab = torch.cat((a,b), dim=1)
+    ab = torch.cat((a,b), dim=1).contiguous(memory_format=torch.channels_last)
     if timing_events:
       timing_events['encoderAB'][0].record()
     ab = self.encoderAB(ab)

@@ -299,6 +299,31 @@ def nvdiffrast_render(K=None, H=None, W=None, ob_in_cams=None, glctx=None, conte
   return color, depth, normal_map
 
 
+def nvdiffrast_render_mask(K, H, W, ob_in_cams, glctx=None, mesh_tensors=None, mesh=None, depth_min=0.001):
+  """Render the same NumPy depth mask as nvdiffrast_render without unused RGB work."""
+  if glctx is None:
+    glctx = dr.RasterizeCudaContext()
+    logging.info("created context")
+
+  if mesh_tensors is None:
+    mesh_tensors = make_mesh_tensors(mesh)
+  pos = mesh_tensors['pos']
+  pos_idx = mesh_tensors['faces']
+
+  ob_in_glcams = torch.tensor(glcam_in_cvcam, device='cuda', dtype=torch.float)[None]@ob_in_cams
+  projection_mat = projection_matrix_from_intrinsics(K, height=H, width=W, znear=0.001, zfar=100)
+  projection_mat = torch.as_tensor(projection_mat.reshape(-1,4,4), device='cuda', dtype=torch.float)
+  mtx = projection_mat@ob_in_glcams
+
+  pts_cam = transform_pts(pos, ob_in_cams)
+  pos_homo = to_homo_torch(pos)
+  pos_clip = (mtx[:,None]@pos_homo[None,...,None])[...,0]
+  rast_out, _ = dr.rasterize(glctx, pos_clip, pos_idx, resolution=np.asarray([H,W]))
+  xyz_map, _ = dr.interpolate(pts_cam, rast_out, pos_idx)
+  depth = torch.flip(xyz_map[...,2], dims=[1])
+  return (depth.detach().cpu().numpy()>depth_min).astype(np.uint8)
+
+
 def finalize_nvdiffrast_render_timing(render_timing):
   for profile_events in render_timing.pop('_render_profile_event_groups', []):
     previous_event = profile_events[0][1]

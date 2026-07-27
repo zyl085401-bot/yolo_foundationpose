@@ -155,7 +155,7 @@ def make_crop_data_batch(render_size, ob_in_cams, mesh, rgb, depth, K, crop_rati
 
 
 class PoseRefinePredictor:
-  def __init__(self, network_input_capture=None, tensorrt_backend=None, render_profile_enabled=False, render_batched_matmul_enabled=False, refiner_stage1_optimizations_enabled=False, refiner_shared_warp_grid_enabled=False):
+  def __init__(self, network_input_capture=None, tensorrt_backend=None, render_profile_enabled=False, render_batched_matmul_enabled=False, refiner_stage1_optimizations_enabled=False, refiner_shared_warp_grid_enabled=False, network_internal_sync_enabled=True):
     logging.info("welcome")
     self.amp = True
     self.run_name = "2023-10-28-18-33-37"
@@ -175,6 +175,7 @@ class PoseRefinePredictor:
     self.cfg['refiner_stage1_optimizations_enabled'] = self.refiner_stage1_optimizations_enabled
     self.refiner_shared_warp_grid_enabled = bool(refiner_shared_warp_grid_enabled)
     self.cfg['refiner_shared_warp_grid_enabled'] = self.refiner_shared_warp_grid_enabled
+    self.network_internal_sync_enabled = bool(network_internal_sync_enabled)
 
     ########## Defaults, to be backward compatible
     if 'use_normal' not in self.cfg:
@@ -284,10 +285,24 @@ class PoseRefinePredictor:
         B_trt = B_trt.contiguous()
         layout_end.record()
         output = self.tensorrt_runner({'A': A_trt, 'B': B_trt})
-        torch.cuda.synchronize()
-        detail['dtype_convert'] = dtype_start.elapsed_time(dtype_end) / 1000.0
-        detail['layout_convert'] = layout_start.elapsed_time(layout_end) / 1000.0
-        detail['tensorrt_execute'] = self.tensorrt_runner.collect_last_cuda_timing() or 0.0
+        tensorrt_events = self.tensorrt_runner.pop_last_cuda_timing_events()
+        if self.network_internal_sync_enabled:
+          torch.cuda.synchronize()
+          detail['dtype_convert'] = dtype_start.elapsed_time(dtype_end) / 1000.0
+          detail['layout_convert'] = layout_start.elapsed_time(layout_end) / 1000.0
+          detail['tensorrt_execute'] = (
+              tensorrt_events[0].elapsed_time(tensorrt_events[1]) / 1000.0
+              if tensorrt_events is not None else 0.0
+          )
+        else:
+          detail['_deferred_cuda_timing_events'] = (
+              ('dtype_convert', dtype_start, dtype_end),
+              ('layout_convert', layout_start, layout_end),
+          )
+          if tensorrt_events is not None:
+            detail['_deferred_cuda_timing_events'] += (
+                ('tensorrt_execute', tensorrt_events[0], tensorrt_events[1]),
+            )
         return output, 'tensorrt', None, detail
       except Exception as error:
         fallback_reason = f'TensorRT runtime failed: {type(error).__name__}: {error}'
@@ -360,10 +375,12 @@ class PoseRefinePredictor:
         'empty_cache': 0.0,
         'total': 0.0,
         'other': 0.0,
+        'network_internal_sync_status': 'enabled' if self.network_internal_sync_enabled else 'disabled',
         '_cuda_stage_events_enabled': self.refiner_stage1_optimizations_enabled,
     }
     network_backends = set()
     fallback_reasons = set()
+    deferred_cuda_timing_events = []
     total_start = time.perf_counter()
 
     for iteration_index in range(iteration):
@@ -385,8 +402,12 @@ class PoseRefinePredictor:
         network_backends.add(network_backend)
         if fallback_reason:
           fallback_reasons.add(fallback_reason)
+        deferred_cuda_timing_events.extend(
+            network_detail.pop('_deferred_cuda_timing_events', ())
+        )
         for name, elapsed in network_detail.items():
-          timing[name] += elapsed
+          if elapsed is not None:
+            timing[name] += elapsed
         self.network_input_capture.capture(
             stage=f'{network_stage}_iter{iteration_index + 1}',
             A=A,
@@ -453,6 +474,8 @@ class PoseRefinePredictor:
     self.last_trans_update = trans_delta
     self.last_rot_update = rot_mat_delta
     torch.cuda.synchronize()
+    for name, start_event, end_event in deferred_cuda_timing_events:
+      timing[name] += start_event.elapsed_time(end_event) / 1000.0
     finalize_cuda_stage_timing(timing)
     timing['total'] = time.perf_counter() - total_start
     if self.render_profile_enabled:

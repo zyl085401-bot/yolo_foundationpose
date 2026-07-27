@@ -199,7 +199,7 @@ def make_crop_data_batch(render_size, ob_in_cams, mesh, rgb, depth, K, crop_rati
 
 
 class ScorePredictor:
-  def __init__(self, amp=True, network_input_capture=None, tensorrt_backend=None, render_profile_enabled=False, render_batched_matmul_enabled=False, scorer_precomputed_xyz_enabled=False, scorer_shared_warp_grid_enabled=False, scorer_skip_unused_depth_warp_enabled=False):
+  def __init__(self, amp=True, network_input_capture=None, tensorrt_backend=None, render_profile_enabled=False, render_batched_matmul_enabled=False, scorer_precomputed_xyz_enabled=False, scorer_shared_warp_grid_enabled=False, scorer_skip_unused_depth_warp_enabled=False, network_internal_sync_enabled=True):
     self.amp = amp
     self.run_name = "2024-01-11-20-02-45"
 
@@ -221,6 +221,7 @@ class ScorePredictor:
     self.cfg['scorer_shared_warp_grid_enabled'] = self.scorer_shared_warp_grid_enabled
     self.scorer_skip_unused_depth_warp_enabled = bool(scorer_skip_unused_depth_warp_enabled)
     self.cfg['scorer_skip_unused_depth_warp_enabled'] = self.scorer_skip_unused_depth_warp_enabled
+    self.network_internal_sync_enabled = bool(network_internal_sync_enabled)
 
     ########## Defaults, to be backward compatible
     if 'use_normal' not in self.cfg:
@@ -308,10 +309,24 @@ class ScorePredictor:
         B_trt = B_trt.contiguous()
         layout_end.record()
         output = runner({'A': A_trt, 'B': B_trt})
-        torch.cuda.synchronize()
-        detail['dtype_convert'] = dtype_start.elapsed_time(dtype_end) / 1000.0
-        detail['layout_convert'] = layout_start.elapsed_time(layout_end) / 1000.0
-        detail['tensorrt_execute'] = runner.collect_last_cuda_timing() or 0.0
+        tensorrt_events = runner.pop_last_cuda_timing_events()
+        if self.network_internal_sync_enabled:
+          torch.cuda.synchronize()
+          detail['dtype_convert'] = dtype_start.elapsed_time(dtype_end) / 1000.0
+          detail['layout_convert'] = layout_start.elapsed_time(layout_end) / 1000.0
+          detail['tensorrt_execute'] = (
+              tensorrt_events[0].elapsed_time(tensorrt_events[1]) / 1000.0
+              if tensorrt_events is not None else 0.0
+          )
+        else:
+          detail['_deferred_cuda_timing_events'] = (
+              ('dtype_convert', dtype_start, dtype_end),
+              ('layout_convert', layout_start, layout_end),
+          )
+          if tensorrt_events is not None:
+            detail['_deferred_cuda_timing_events'] += (
+                ('tensorrt_execute', tensorrt_events[0], tensorrt_events[1]),
+            )
         return output, 'tensorrt', None, detail
       except Exception as error:
         fallback_reason = f'TensorRT runtime failed for N={candidate_count}: {type(error).__name__}: {error}'
@@ -356,9 +371,13 @@ class ScorePredictor:
       'empty_cache': 0.0,
       'total': 0.0,
       'other': 0.0,
+      'network_internal_sync_status': 'enabled' if self.network_internal_sync_enabled else 'disabled',
     }
     network_backends = set()
     fallback_reasons = set()
+    deferred_cuda_timing_events = []
+    network_forward_events = []
+    output_convert_events = []
     torch.cuda.synchronize()
     total_start = time.perf_counter()
     ob_in_cams = torch.as_tensor(ob_in_cams, dtype=torch.float, device='cuda')
@@ -394,20 +413,36 @@ class ScorePredictor:
         torch.cuda.synchronize()
         timing['input_pack'] += time.perf_counter() - t0
         t0 = time.perf_counter()
+        network_start = None
+        if not self.network_internal_sync_enabled:
+          network_start = torch.cuda.Event(enable_timing=True)
+          network_start.record()
         output, network_backend, fallback_reason, network_detail = self._run_network(A, B)
-        timing['network_forward'] += time.perf_counter() - t0
+        if self.network_internal_sync_enabled or network_backend != 'tensorrt':
+          timing['network_forward'] += time.perf_counter() - t0
+        else:
+          network_end = torch.cuda.Event(enable_timing=True)
+          network_end.record()
+          network_forward_events.append((network_start, network_end))
         network_backends.add(network_backend)
         if fallback_reason:
           fallback_reasons.add(fallback_reason)
+        deferred_cuda_timing_events.extend(
+            network_detail.pop('_deferred_cuda_timing_events', ())
+        )
         for name, elapsed in network_detail.items():
-          timing[name] += elapsed
+          if elapsed is not None:
+            timing[name] += elapsed
         output_start = torch.cuda.Event(enable_timing=True)
         output_end = torch.cuda.Event(enable_timing=True)
         output_start.record()
         scores_cur = output["score_logit"].float().reshape(-1)
         output_end.record()
-        torch.cuda.synchronize()
-        timing['output_convert'] += output_start.elapsed_time(output_end) / 1000.0
+        if self.network_internal_sync_enabled or network_backend != 'tensorrt':
+          torch.cuda.synchronize()
+          timing['output_convert'] += output_start.elapsed_time(output_end) / 1000.0
+        else:
+          output_convert_events.append((output_start, output_end))
         self.network_input_capture.capture(
             stage=network_stage,
             A=A,
@@ -439,6 +474,12 @@ class ScorePredictor:
 
     def finalize_timing():
       torch.cuda.synchronize()
+      for start_event, end_event in network_forward_events:
+        timing['network_forward'] += start_event.elapsed_time(end_event) / 1000.0
+      for start_event, end_event in output_convert_events:
+        timing['output_convert'] += start_event.elapsed_time(end_event) / 1000.0
+      for name, start_event, end_event in deferred_cuda_timing_events:
+        timing[name] += start_event.elapsed_time(end_event) / 1000.0
       timing['total'] = time.perf_counter() - total_start
       if self.render_profile_enabled:
         render_profile_keys = (

@@ -82,6 +82,7 @@ class RegisterQualityResult:
   translation_drift: float | None
   render_iou: float | None
   top1_top2_score_gap: float | None
+  rendered_mask: np.ndarray | None = None
 
 
 class PoseRecordWriter:
@@ -372,6 +373,9 @@ def build_tracker(tracker_cfg: dict) -> FoundationPoseRealtimeTracker:
       vis_mode=tracker_cfg.get("vis_mode", "box"),
       contour_thickness=int(tracker_cfg.get("contour_thickness", 3)),
       axis_scale=float(tracker_cfg.get("axis_scale", 0.1)),
+      network_internal_sync_enabled=bool(tracker_cfg.get("network_internal_sync_enabled", True)),
+      frame_statistics_reuse_enabled=bool(tracker_cfg.get("frame_statistics_reuse_enabled", False)),
+      quality_render_mask_reuse_enabled=bool(tracker_cfg.get("quality_render_mask_reuse_enabled", False)),
   )
 
 
@@ -594,6 +598,7 @@ def evaluate_register_quality(
   uncertain_render_iou = float(runtime_cfg.get("register_uncertain_render_iou", 0.0))
   translation_drift = None
   render_iou = None
+  rendered_mask = None
 
   mask_translation = estimate_mask_translation(depth, mask, K)
   if max_translation_drift > 0 and mask_translation is not None:
@@ -613,7 +618,8 @@ def evaluate_register_quality(
 
   needs_render_iou = min_render_iou > 0 or (uncertain_score_gap > 0 and uncertain_render_iou > 0)
   if needs_render_iou:
-    render_iou = tracker.mask_iou(K, depth.shape[:2], mask)
+    rendered_mask = tracker.render_pose_mask(K, depth.shape[:2])
+    render_iou = tracker.mask_iou(K, depth.shape[:2], mask, rendered_mask=rendered_mask)
   score_gap = top1_top2_score_gap(tracker)
 
   if min_render_iou > 0 and render_iou is not None and render_iou < min_render_iou:
@@ -623,6 +629,7 @@ def evaluate_register_quality(
         translation_drift=translation_drift,
         render_iou=render_iou,
         top1_top2_score_gap=score_gap,
+        rendered_mask=rendered_mask,
     )
 
   if (
@@ -639,6 +646,7 @@ def evaluate_register_quality(
         translation_drift=translation_drift,
         render_iou=render_iou,
         top1_top2_score_gap=score_gap,
+        rendered_mask=rendered_mask,
     )
 
   return RegisterQualityResult(
@@ -647,6 +655,7 @@ def evaluate_register_quality(
       translation_drift=translation_drift,
       render_iou=render_iou,
       top1_top2_score_gap=score_gap,
+      rendered_mask=rendered_mask,
   )
 
 
@@ -767,12 +776,15 @@ def foundation_register_timing_rows(timing: dict, register_wall_time: float | No
   rows = [
       ("foundation_total", seconds_to_ms(register_time)),
       ("  foundation_depth_preprocess", seconds_to_ms(timing.get("depth_preprocess"))),
+      ("  foundation_frame_statistics_reuse", timing.get("frame_statistics_reuse_status")),
+      ("  foundation_frame_statistics", seconds_to_ms(timing.get("frame_statistics"))),
       ("  foundation_pose_hypothesis", seconds_to_ms(timing.get("pose_hypothesis"))),
       ("  foundation_axis_prior", seconds_to_ms(timing.get("axis_prior"))),
       ("  foundation_frame_to_cuda", seconds_to_ms(timing.get("frame_to_cuda"))),
       ("  foundation_refiner", seconds_to_ms(timing.get("refiner"))),
       ("    refiner_coarse", seconds_to_ms(timing.get("refiner_coarse"))),
       ("      refiner_coarse_backend", refiner_coarse_detail.get("network_backend")),
+      ("      refiner_coarse_network_internal_sync", refiner_coarse_detail.get("network_internal_sync_status")),
       ("      refiner_coarse_fallback", refiner_coarse_detail.get("fallback_reason")),
       ("      refiner_coarse_crop_window", seconds_to_ms(refiner_coarse_detail.get("crop_window"))),
       ("      refiner_coarse_render", seconds_to_ms(refiner_coarse_detail.get("render"))),
@@ -794,6 +806,7 @@ def foundation_register_timing_rows(timing: dict, register_wall_time: float | No
       ("      refiner_coarse_other", seconds_to_ms(refiner_coarse_detail.get("other"))),
       ("    refiner_fine", seconds_to_ms(timing.get("refiner_fine"))),
       ("      refiner_fine_backend", refiner_fine_detail.get("network_backend")),
+      ("      refiner_fine_network_internal_sync", refiner_fine_detail.get("network_internal_sync_status")),
       ("      refiner_fine_fallback", refiner_fine_detail.get("fallback_reason")),
       ("      refiner_fine_crop_window", seconds_to_ms(refiner_fine_detail.get("crop_window"))),
       ("      refiner_fine_render", seconds_to_ms(refiner_fine_detail.get("render"))),
@@ -820,6 +833,7 @@ def foundation_register_timing_rows(timing: dict, register_wall_time: float | No
       ("    refiner_transform", seconds_to_ms(refiner_detail.get("transform"))),
       ("    refiner_input_pack", seconds_to_ms(refiner_detail.get("input_pack"))),
       ("    refiner_backend", refiner_detail.get("network_backend")),
+      ("    refiner_network_internal_sync", refiner_detail.get("network_internal_sync_status")),
       ("    refiner_fallback", refiner_detail.get("fallback_reason")),
       ("    refiner_network_forward", seconds_to_ms(refiner_detail.get("network_forward"))),
       ("      refiner_layout_convert", seconds_to_ms(refiner_detail.get("layout_convert"))),
@@ -838,6 +852,7 @@ def foundation_register_timing_rows(timing: dict, register_wall_time: float | No
       ("    coarse_scorer_status", timing.get("coarse_scorer_status")),
       ("    scorer_coarse", seconds_to_ms(timing.get("scorer_coarse"))),
       ("      scorer_coarse_backend", scorer_coarse_detail.get("network_backend")),
+      ("      scorer_coarse_network_internal_sync", scorer_coarse_detail.get("network_internal_sync_status")),
       ("      scorer_coarse_fallback", scorer_coarse_detail.get("fallback_reason")),
       ("      scorer_coarse_crop_window", seconds_to_ms(scorer_coarse_detail.get("crop_window"))),
       ("      scorer_coarse_render", seconds_to_ms(scorer_coarse_detail.get("render"))),
@@ -860,6 +875,7 @@ def foundation_register_timing_rows(timing: dict, register_wall_time: float | No
       ("      scorer_coarse_detail_total", seconds_to_ms(scorer_coarse_detail.get("total"))),
       ("    scorer_fine", seconds_to_ms(timing.get("scorer_fine"))),
       ("      scorer_fine_backend", scorer_fine_detail.get("network_backend")),
+      ("      scorer_fine_network_internal_sync", scorer_fine_detail.get("network_internal_sync_status")),
       ("      scorer_fine_fallback", scorer_fine_detail.get("fallback_reason")),
       ("      scorer_fine_crop_window", seconds_to_ms(scorer_fine_detail.get("crop_window"))),
       ("      scorer_fine_render", seconds_to_ms(scorer_fine_detail.get("render"))),
@@ -887,6 +903,7 @@ def foundation_register_timing_rows(timing: dict, register_wall_time: float | No
       ("    scorer_transform", seconds_to_ms(scorer_detail.get("transform"))),
       ("    scorer_input_pack", seconds_to_ms(scorer_detail.get("input_pack"))),
       ("    scorer_backend", scorer_detail.get("network_backend")),
+      ("    scorer_network_internal_sync", scorer_detail.get("network_internal_sync_status")),
       ("    scorer_fallback", scorer_detail.get("fallback_reason")),
       ("    scorer_network_forward", seconds_to_ms(scorer_detail.get("network_forward"))),
       ("      scorer_layout_convert", seconds_to_ms(scorer_detail.get("layout_convert"))),
@@ -1232,6 +1249,7 @@ def main() -> None:
       processed_timestamp = frame_message.timestamp
       reset_tracker_after_record = False
       current_frame_detection = None
+      quality_rendered_mask = None
 
       if not tracker.initialized:
         detection_message = yolo_worker.get_latest()
@@ -1365,6 +1383,8 @@ def main() -> None:
             mask=detection.mask,
             runtime_cfg=runtime_cfg,
         )
+        if tracker.quality_render_mask_reuse_enabled:
+          quality_rendered_mask = quality_result.rendered_mask
         if not quality_result.accepted:
           log_runtime(
               verbose_runtime,
@@ -1467,7 +1487,12 @@ def main() -> None:
           or (pose_result.mode == "track" and record_save_track)
         ) and current_frame_detection is not None
       if show_window or should_record_pose:
-        vis = tracker.draw_visualization(color, K, pose_result.pose)
+        vis = tracker.draw_visualization(
+            color,
+            K,
+            pose_result.pose,
+            rendered_mask=quality_rendered_mask,
+        )
         if current_frame_detection is not None:
           mask_overlay = current_frame_detection.mask.astype(bool)
           vis[mask_overlay] = (0.65 * vis[mask_overlay] + 0.35 * np.array([255, 0, 0])).astype(np.uint8)

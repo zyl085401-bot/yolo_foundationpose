@@ -136,6 +136,43 @@ RUN python3 -m pip install \
             -r /opt/offline/requirements.jetson.yolo26.txt \
         && python3 -c 'import ultralytics; from ultralytics.nn.modules.head import Segment26; print("Ultralytics YOLO26:", ultralytics.__version__)'
 
+# The NVIDIA image OpenCV has GUI=NONE. Install the validated ARM64 Qt5 wheel
+# and its missing XCB dependencies late so all GPU build layers stay cached.
+COPY FoundationPose/docker/requirements.jetson.gui.txt /opt/offline/requirements.jetson.gui.txt
+COPY FoundationPose/docker/jetson_offline_jp61/gui/ /opt/offline/gui/
+RUN set -eu; \
+        gui_debs=''; \
+        for wanted in x11-common libice6 libsm6; do \
+            match=''; \
+            for deb in /opt/offline/gui/debs/*.deb; do \
+                package="$(dpkg-deb --field "${deb}" Package)"; \
+                arch="$(dpkg-deb --field "${deb}" Architecture)"; \
+                if [ "${package}" = "${wanted}" ] \
+                    && { [ "${arch}" = arm64 ] || [ "${arch}" = all ]; }; then \
+                    test -z "${match}" || { echo "Duplicate deb for ${wanted}" >&2; exit 1; }; \
+                    match="${deb}"; \
+                fi; \
+            done; \
+            test -n "${match}" || { echo "Missing ARM64/all deb: ${wanted}" >&2; exit 1; }; \
+            gui_debs="${gui_debs} ${match}"; \
+        done; \
+        dpkg --unpack ${gui_debs}; \
+        dpkg --configure -a; \
+        ldconfig; \
+        python3 -m pip install \
+          --no-index \
+          --find-links=/opt/offline/gui \
+          --no-deps \
+                    --target=/opt/opencv-gui \
+          -r /opt/offline/requirements.jetson.gui.txt; \
+                PYTHONPATH="/opt/opencv-gui:${PYTHONPATH}" python3 -c 'import cv2; info=cv2.getBuildInformation(); assert cv2.__file__.startswith("/opt/opencv-gui/"), cv2.__file__; assert "GUI:                           QT5" in info, info; print("OpenCV Qt GUI:", cv2.__version__, cv2.__file__)'; \
+                plugin="$(find /opt/opencv-gui/cv2 -name libqxcb.so -print -quit)"; \
+        test -n "${plugin}"; \
+        ! ldd "${plugin}" | grep -q 'not found'
+
+ENV PYTHONPATH=/opt/opencv-gui:${PYTHONPATH} \
+        QT_X11_NO_MITSHM=1
+
 RUN python3 -c 'import cv2, kornia, mycpp, nvdiffrast.torch, numpy, open3d, pyrealsense2, pytorch3d, scipy, torch, torchvision, trimesh, ultralytics, warp; print("Jetson FoundationPose imports: OK"); print("Python/PyTorch:", torch.__version__, "CUDA", torch.version.cuda); print("NumPy/OpenCV/Open3D:", numpy.__version__, cv2.__version__, open3d.__version__)'
 
 WORKDIR /workspace/yolo_foundationpose

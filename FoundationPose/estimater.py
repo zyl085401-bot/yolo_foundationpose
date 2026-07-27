@@ -84,6 +84,18 @@ class FoundationPose:
     pcd = pcd.voxel_down_sample(self.vox_size)
     self.max_xyz = np.asarray(pcd.points).max(axis=0)
     self.min_xyz = np.asarray(pcd.points).min(axis=0)
+    min_xyz = self.min_xyz
+    max_xyz = self.max_xyz
+    self.geometry_bbox_corners = torch.as_tensor([
+      [min_xyz[0], min_xyz[1], min_xyz[2]],
+      [min_xyz[0], min_xyz[1], max_xyz[2]],
+      [min_xyz[0], max_xyz[1], min_xyz[2]],
+      [min_xyz[0], max_xyz[1], max_xyz[2]],
+      [max_xyz[0], min_xyz[1], min_xyz[2]],
+      [max_xyz[0], min_xyz[1], max_xyz[2]],
+      [max_xyz[0], max_xyz[1], min_xyz[2]],
+      [max_xyz[0], max_xyz[1], max_xyz[2]],
+    ], device='cuda', dtype=torch.float)
     self.pts = torch.tensor(np.asarray(pcd.points), dtype=torch.float32, device='cuda')
     self.normals = F.normalize(torch.tensor(np.asarray(pcd.normals), dtype=torch.float32, device='cuda'), dim=-1)
     logging.info(f'self.pts:{self.pts.shape}')
@@ -148,46 +160,98 @@ class FoundationPose:
     logging.info(f"self.rot_grid: {self.rot_grid.shape}")
 
 
-  def generate_random_pose_hypo(self, K, rgb, depth, mask, scene_pts=None):
+  def prepare_frame_statistics(self, depth, mask):
+    mask_positive = mask>0
+    mask_rows, mask_cols = np.where(mask_positive)
+    depth_valid = depth>=0.001
+    valid_depth = mask.astype(bool) & depth_valid
+    return {
+      'mask_positive': mask_positive,
+      'mask_rows': mask_rows,
+      'mask_cols': mask_cols,
+      'valid_positive_depth': mask_positive & depth_valid,
+      'valid_depth': valid_depth,
+      'median_depth': np.median(depth[valid_depth]) if valid_depth.any() else None,
+    }
+
+
+  def generate_random_pose_hypo(self, K, rgb, depth, mask, scene_pts=None, frame_statistics=None):
     '''
     @scene_pts: torch tensor (N,3)
     '''
     ob_in_cams = self.rot_grid.clone()
-    center = self.guess_translation(depth=depth, mask=mask, K=K)
+    center = self.guess_translation(depth=depth, mask=mask, K=K, frame_statistics=frame_statistics)
     ob_in_cams[:,:3,3] = torch.tensor(center, device='cuda', dtype=torch.float).reshape(1,3)
     return ob_in_cams
 
 
-  def guess_translation(self, depth, mask, K):
-    vs,us = np.where(mask>0)
+  def guess_translation(self, depth, mask, K, frame_statistics=None):
+    if frame_statistics is not None and 'translation_center' in frame_statistics:
+      center = frame_statistics['translation_center']
+      status = frame_statistics.get('translation_status')
+      if status == 'empty_mask':
+        logging.info(f'mask is all zero')
+      elif status == 'empty_valid_depth':
+        logging.info(f"valid is empty")
+      if self.debug>=2 and status is None:
+        pcd = toOpen3dCloud(center.reshape(1,3))
+        o3d.io.write_point_cloud(f'{self.debug_dir}/init_center.ply', pcd)
+      return center
+
+    if frame_statistics is None:
+      vs,us = np.where(mask>0)
+      valid = mask.astype(bool) & (depth>=0.001)
+      zc = np.median(depth[valid]) if valid.any() else None
+    else:
+      vs = frame_statistics['mask_rows']
+      us = frame_statistics['mask_cols']
+      valid = frame_statistics['valid_depth']
+      zc = frame_statistics['median_depth']
+
     if len(us)==0:
       logging.info(f'mask is all zero')
-      return np.zeros((3))
+      center = np.zeros((3))
+      if frame_statistics is not None:
+        frame_statistics['translation_center'] = center
+        frame_statistics['translation_status'] = 'empty_mask'
+      return center
     uc = (us.min()+us.max())/2.0
     vc = (vs.min()+vs.max())/2.0
-    valid = mask.astype(bool) & (depth>=0.001)
     if not valid.any():
       logging.info(f"valid is empty")
-      return np.zeros((3))
+      center = np.zeros((3))
+      if frame_statistics is not None:
+        frame_statistics['translation_center'] = center
+        frame_statistics['translation_status'] = 'empty_valid_depth'
+      return center
 
-    zc = np.median(depth[valid])
     center = (np.linalg.inv(K)@np.asarray([uc,vc,1]).reshape(3,1))*zc
+    center = center.reshape(3)
+    if frame_statistics is not None:
+      frame_statistics['translation_center'] = center
 
     if self.debug>=2:
       pcd = toOpen3dCloud(center.reshape(1,3))
       o3d.io.write_point_cloud(f'{self.debug_dir}/init_center.ply', pcd)
 
-    return center.reshape(3)
+    return center
 
 
-  def compute_geometry_candidate_score(self, poses, K, depth, mask):
-    vs, us = np.where(mask>0)
+  def compute_geometry_candidate_score(self, poses, K, depth, mask, frame_statistics=None):
+    if frame_statistics is None:
+      vs, us = np.where(mask>0)
+      valid = mask.astype(bool) & (depth>=0.001)
+      median_depth = float(np.median(depth[valid])) if valid.any() else None
+    else:
+      vs = frame_statistics['mask_rows']
+      us = frame_statistics['mask_cols']
+      valid = frame_statistics['valid_depth']
+      median_depth = frame_statistics['median_depth']
     if len(us)==0:
       return torch.zeros(len(poses), device=poses.device, dtype=torch.float)
 
-    valid = mask.astype(bool) & (depth>=0.001)
     if valid.any():
-      median_depth = float(np.median(depth[valid]))
+      median_depth = float(median_depth)
     else:
       median_depth = float(poses[:,2,3].median().detach().cpu())
 
@@ -202,21 +266,16 @@ class FoundationPose:
     target_area = max(target_width * target_height, 1.0)
     target_aspect = target_width / target_height
 
-    min_xyz = torch.as_tensor(self.min_xyz, device=poses.device, dtype=torch.float)
-    max_xyz = torch.as_tensor(self.max_xyz, device=poses.device, dtype=torch.float)
-    corners = torch.stack([
-      torch.stack([min_xyz[0], min_xyz[1], min_xyz[2]]),
-      torch.stack([min_xyz[0], min_xyz[1], max_xyz[2]]),
-      torch.stack([min_xyz[0], max_xyz[1], min_xyz[2]]),
-      torch.stack([min_xyz[0], max_xyz[1], max_xyz[2]]),
-      torch.stack([max_xyz[0], min_xyz[1], min_xyz[2]]),
-      torch.stack([max_xyz[0], min_xyz[1], max_xyz[2]]),
-      torch.stack([max_xyz[0], max_xyz[1], min_xyz[2]]),
-      torch.stack([max_xyz[0], max_xyz[1], max_xyz[2]]),
-    ], dim=0)
+    corners = self.geometry_bbox_corners.to(device=poses.device)
 
     cam_points = torch.einsum('bij,kj->bki', poses[:,:3,:3], corners) + poses[:,:3,3].reshape(-1,1,3)
-    K_t = torch.as_tensor(K, device=poses.device, dtype=torch.float)
+    if frame_statistics is None:
+      K_t = torch.as_tensor(K, device=poses.device, dtype=torch.float)
+    else:
+      K_t = frame_statistics.get('K_cuda')
+      if K_t is None or K_t.device != poses.device:
+        K_t = torch.as_tensor(K, device=poses.device, dtype=torch.float)
+        frame_statistics['K_cuda'] = K_t
     projected = torch.einsum('ij,bkj->bki', K_t, cam_points)
     z = projected[...,2].clamp(min=1e-6)
     u = projected[...,0] / z
@@ -248,16 +307,21 @@ class FoundationPose:
     return center_error + depth_error + 0.5 * area_error + 0.5 * aspect_error + (1.0 - bbox_iou)
 
 
-  def select_coarse_score_candidates_by_geometry(self, poses, K, depth, mask, top_k):
+  def select_coarse_score_candidates_by_geometry(self, poses, K, depth, mask, top_k, frame_statistics=None):
     if top_k>=len(poses):
       return torch.arange(len(poses), device=poses.device)
-    score = self.compute_geometry_candidate_score(poses, K, depth, mask)
+    score = self.compute_geometry_candidate_score(poses, K, depth, mask, frame_statistics=frame_statistics)
     return score.argsort()[:top_k]
 
 
-  def estimate_axis_prior_from_depth_pca(self, xyz_map, mask, min_points=500, min_confidence=1.4, max_points=3000):
-    valid = (mask>0) & (xyz_map[...,2]>=0.001) & np.isfinite(xyz_map).all(axis=-1)
-    points = xyz_map[valid]
+  def estimate_axis_prior_from_depth_pca(self, xyz_map, mask, min_points=500, min_confidence=1.4, max_points=3000, frame_statistics=None):
+    if frame_statistics is None:
+      valid = (mask>0) & (xyz_map[...,2]>=0.001) & np.isfinite(xyz_map).all(axis=-1)
+      points = xyz_map[valid]
+    else:
+      points = xyz_map[frame_statistics['mask_positive']]
+      valid = (points[:,2]>=0.001) & np.isfinite(points).all(axis=-1)
+      points = points[valid]
     if len(points)<min_points:
       return None, {
         'axis_prior_status': 'too_few_points',
@@ -372,7 +436,7 @@ class FoundationPose:
     }
 
 
-  def register(self, K, rgb, depth, ob_mask, ob_id=None, glctx=None, iteration=5, init_strategy='default', coarse_refine_iter=1, coarse_score_filter='none', coarse_score_top_k=999999, fine_refine_iter=2, fine_top_k=16, axis_prior_filter='none', axis_prior_model_axis=(0,0,1), axis_prior_max_angle_deg=45, axis_prior_min_candidates=12, axis_prior_max_candidates=0, axis_prior_min_points=500, axis_prior_min_confidence=1.4, axis_prior_debug=False, skip_redundant_coarse_scorer=False):
+  def register(self, K, rgb, depth, ob_mask, ob_id=None, glctx=None, iteration=5, init_strategy='default', coarse_refine_iter=1, coarse_score_filter='none', coarse_score_top_k=999999, fine_refine_iter=2, fine_top_k=16, axis_prior_filter='none', axis_prior_model_axis=(0,0,1), axis_prior_max_angle_deg=45, axis_prior_min_candidates=12, axis_prior_max_candidates=0, axis_prior_min_points=500, axis_prior_min_confidence=1.4, axis_prior_debug=False, skip_redundant_coarse_scorer=False, frame_statistics_reuse_enabled=False):
     '''Copmute pose from given pts to self.pcd
     @pts: (N,3) np array, downsampled scene points
     '''
@@ -406,11 +470,20 @@ class FoundationPose:
       cv2.imwrite(f'{self.debug_dir}/ob_mask.png', (ob_mask*255.0).clip(0,255))
 
     normal_map = None
-    valid = (depth>=0.001) & (ob_mask>0)
+    frame_statistics = None
+    timing['frame_statistics_reuse_status'] = 'enabled' if frame_statistics_reuse_enabled else 'disabled'
+    if frame_statistics_reuse_enabled:
+      t0 = time.perf_counter()
+      frame_statistics = self.prepare_frame_statistics(depth=depth, mask=ob_mask)
+      timing['frame_statistics'] = time.perf_counter() - t0
+      valid = frame_statistics['valid_positive_depth']
+    else:
+      timing['frame_statistics'] = 0.0
+      valid = (depth>=0.001) & (ob_mask>0)
     if valid.sum()<4:
       logging.info(f'valid too small, return')
       pose = np.eye(4)
-      pose[:3,3] = self.guess_translation(depth=depth, mask=ob_mask, K=K)
+      pose[:3,3] = self.guess_translation(depth=depth, mask=ob_mask, K=K, frame_statistics=frame_statistics)
       torch.cuda.synchronize()
       timing['register'] = time.perf_counter() - t_register_start
       self.last_register_timing = timing
@@ -429,10 +502,10 @@ class FoundationPose:
     self.ob_mask = ob_mask
 
     t0 = time.perf_counter()
-    poses = self.generate_random_pose_hypo(K=K, rgb=rgb, depth=depth, mask=ob_mask, scene_pts=None)
+    poses = self.generate_random_pose_hypo(K=K, rgb=rgb, depth=depth, mask=ob_mask, scene_pts=None, frame_statistics=frame_statistics)
     poses = poses.data.cpu().numpy()
     logging.info(f'poses:{poses.shape}')
-    center = self.guess_translation(depth=depth, mask=ob_mask, K=K)
+    center = self.guess_translation(depth=depth, mask=ob_mask, K=K, frame_statistics=frame_statistics)
 
     poses = torch.as_tensor(poses, device='cuda', dtype=torch.float)
     poses[:,:3,3] = torch.as_tensor(center.reshape(1,3), device='cuda')
@@ -459,6 +532,7 @@ class FoundationPose:
           mask=ob_mask,
           min_points=axis_prior_min_points,
           min_confidence=axis_prior_min_confidence,
+          frame_statistics=frame_statistics,
       )
       poses, filter_info = self.filter_pose_candidates_by_axis_prior(
           poses=poses,
@@ -505,7 +579,7 @@ class FoundationPose:
       t0 = time.perf_counter()
       score_k = max(1, min(int(coarse_score_top_k), len(poses)))
       if coarse_score_filter == 'geometry' and score_k < len(poses):
-        score_ids = self.select_coarse_score_candidates_by_geometry(poses, K, depth, ob_mask, score_k)
+        score_ids = self.select_coarse_score_candidates_by_geometry(poses, K, depth, ob_mask, score_k, frame_statistics=frame_statistics)
       else:
         score_ids = torch.linspace(0, len(poses) - 1, steps=score_k, device=poses.device).long()
       score_poses = poses[score_ids]
@@ -625,7 +699,7 @@ class FoundationPose:
 
     torch.cuda.synchronize()
     timing['register'] = time.perf_counter() - t_register_start
-    known_time = sum(timing.get(key, 0.0) for key in ('depth_preprocess', 'pose_hypothesis', 'axis_prior', 'frame_to_cuda', 'refiner', 'coarse_score_select', 'scorer', 'topk_select', 'sort_select'))
+    known_time = sum(timing.get(key, 0.0) for key in ('depth_preprocess', 'frame_statistics', 'pose_hypothesis', 'axis_prior', 'frame_to_cuda', 'refiner', 'coarse_score_select', 'scorer', 'topk_select', 'sort_select'))
     timing['other'] = max(timing['register'] - known_time, 0.0)
     self.last_register_timing = timing
 

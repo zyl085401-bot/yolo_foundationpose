@@ -350,7 +350,17 @@ def main() -> None:
             ("repeat_total", seconds_to_ms(repeat_elapsed)),
         ],
     )
-    visualization = tracker.draw_visualization(frame.color, frame.K, new_pose)
+    visualization_start = time.perf_counter()
+    visualization = tracker.draw_visualization(
+        frame.color,
+        frame.K,
+        new_pose,
+        rendered_mask=(
+            quality_result.rendered_mask
+            if tracker.quality_render_mask_reuse_enabled else None
+        ),
+    )
+    visualization_elapsed = time.perf_counter() - visualization_start
     mask_pixels = mask.mask.astype(bool)
     visualization[mask_pixels] = (
         0.65 * visualization[mask_pixels] + 0.35 * np.array([255, 0, 0])
@@ -384,6 +394,7 @@ def main() -> None:
         "validation_seconds": validation_elapsed,
         "elapsed_seconds": elapsed,
         "quality_gate_seconds": quality_elapsed,
+        "visualization_seconds": visualization_elapsed,
         "top5_diagnostics_seconds": topk_elapsed,
         "repeat_total_seconds": repeat_elapsed,
         "foundation_timing_seconds": serializable_foundation_timing(timing),
@@ -406,6 +417,7 @@ def main() -> None:
       "validation": timing_statistics([item["validation_seconds"] for item in results]),
       "foundation_register": timing_statistics([item["elapsed_seconds"] for item in results]),
       "quality_gate": timing_statistics([item["quality_gate_seconds"] for item in results]),
+      "visualization": timing_statistics([item["visualization_seconds"] for item in results]),
       "top5_diagnostics": timing_statistics([item["top5_diagnostics_seconds"] for item in results]),
       "repeat_total": timing_statistics([item["repeat_total_seconds"] for item in results]),
   }

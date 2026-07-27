@@ -26,6 +26,7 @@ from estimater import (  # noqa: E402
     draw_posed_3d_box,
     draw_xyz_axis,
     nvdiffrast_render,
+    nvdiffrast_render_mask,
     set_logging_format,
     set_seed,
 )
@@ -162,6 +163,9 @@ class FoundationPoseRealtimeTracker:
       contour_thickness: int = 3,
       axis_scale: float = 0.1,
       skip_redundant_coarse_scorer: bool = False,
+      network_internal_sync_enabled: bool = True,
+      frame_statistics_reuse_enabled: bool = False,
+      quality_render_mask_reuse_enabled: bool = False,
   ):
     set_logging_format()
     set_seed(0)
@@ -180,6 +184,8 @@ class FoundationPoseRealtimeTracker:
     self.fine_refine_iter = fine_refine_iter
     self.fine_top_k = fine_top_k
     self.skip_redundant_coarse_scorer = skip_redundant_coarse_scorer
+    self.frame_statistics_reuse_enabled = frame_statistics_reuse_enabled
+    self.quality_render_mask_reuse_enabled = quality_render_mask_reuse_enabled
     self.axis_prior_filter = axis_prior_filter
     self.axis_prior_model_axis = axis_prior_model_axis
     self.axis_prior_max_angle_deg = axis_prior_max_angle_deg
@@ -221,6 +227,7 @@ class FoundationPoseRealtimeTracker:
       scorer_precomputed_xyz_enabled=scorer_precomputed_xyz_enabled,
       scorer_shared_warp_grid_enabled=scorer_shared_warp_grid_enabled,
       scorer_skip_unused_depth_warp_enabled=scorer_skip_unused_depth_warp_enabled,
+      network_internal_sync_enabled=network_internal_sync_enabled,
     )
     self.refiner = PoseRefinePredictor(
       network_input_capture=network_input_capture,
@@ -229,6 +236,7 @@ class FoundationPoseRealtimeTracker:
       render_batched_matmul_enabled=render_batched_matmul_enabled,
       refiner_stage1_optimizations_enabled=refiner_stage1_optimizations_enabled,
       refiner_shared_warp_grid_enabled=refiner_shared_warp_grid_enabled,
+      network_internal_sync_enabled=network_internal_sync_enabled,
     )
     self.glctx = dr.RasterizeCudaContext()
     self.estimator = FoundationPose(
@@ -274,6 +282,7 @@ class FoundationPoseRealtimeTracker:
         axis_prior_min_points=self.axis_prior_min_points,
         axis_prior_min_confidence=self.axis_prior_min_confidence,
         axis_prior_debug=self.axis_prior_visualization_enabled,
+        frame_statistics_reuse_enabled=self.frame_statistics_reuse_enabled,
     )
     if self.axis_prior_visualization_enabled:
       try:
@@ -297,17 +306,15 @@ class FoundationPoseRealtimeTracker:
     K = np.ascontiguousarray(K, dtype=np.float32)
     height, width = image_shape[:2]
     ob_in_cams = torch.as_tensor(pose_to_render, device="cuda", dtype=torch.float).reshape(1, 4, 4)
-    _, render_depth, _ = nvdiffrast_render(
+    rendered_masks = nvdiffrast_render_mask(
         K=K,
         H=height,
         W=width,
         ob_in_cams=ob_in_cams,
         glctx=self.glctx,
         mesh_tensors=self.estimator.mesh_tensors,
-        output_size=np.asarray([height, width]),
-        use_light=False,
     )
-    return (render_depth[0].detach().cpu().numpy() > 0.001).astype(np.uint8)
+    return rendered_masks[0]
 
   def _render_pose_masks(self, K: np.ndarray, image_shape: tuple[int, int], poses: np.ndarray) -> np.ndarray:
     K = np.ascontiguousarray(K, dtype=np.float32)
@@ -513,10 +520,12 @@ class FoundationPoseRealtimeTracker:
       json.dump(summary, file, indent=2, ensure_ascii=False)
     print(f"[AxisPriorDebug] Saved candidate visualization: {record_dir}")
 
-  def mask_iou(self, K: np.ndarray, image_shape: tuple[int, int], target_mask: np.ndarray) -> float:
+  def mask_iou(self, K: np.ndarray, image_shape: tuple[int, int], target_mask: np.ndarray, rendered_mask: np.ndarray | None = None) -> float:
     if not self.initialized:
       return 0.0
-    rendered_mask = self.render_pose_mask(K, image_shape)
+    if rendered_mask is None:
+      rendered_mask = self.render_pose_mask(K, image_shape)
+    rendered_mask = np.ascontiguousarray(rendered_mask > 0, dtype=np.uint8)
     target = np.ascontiguousarray(target_mask > 0, dtype=np.uint8)
     intersection = np.logical_and(rendered_mask > 0, target > 0).sum()
     union = np.logical_or(rendered_mask > 0, target > 0).sum()
@@ -528,6 +537,7 @@ class FoundationPoseRealtimeTracker:
       K: np.ndarray,
       pose: np.ndarray | None = None,
       centered_pose: np.ndarray | None = None,
+      rendered_mask: np.ndarray | None = None,
   ) -> np.ndarray:
     color = np.ascontiguousarray(color, dtype=np.uint8)
     K = np.ascontiguousarray(K, dtype=np.float32)
@@ -541,7 +551,12 @@ class FoundationPoseRealtimeTracker:
     if self.vis_mode in ("box", "both"):
       vis = draw_posed_3d_box(K, img=vis, ob_in_cam=center_pose, bbox=self.bbox)
     if self.vis_mode in ("contour", "both"):
-      contour_mask = self.render_pose_mask(K, color.shape[:2], pose=centered_pose) * 255
+      if rendered_mask is None:
+        rendered_mask = self.render_pose_mask(K, color.shape[:2], pose=centered_pose)
+      rendered_mask = np.asarray(rendered_mask)
+      if rendered_mask.shape != color.shape[:2]:
+        raise ValueError(f"rendered mask/image shape mismatch: mask={rendered_mask.shape}, image={color.shape[:2]}")
+      contour_mask = np.ascontiguousarray(rendered_mask > 0, dtype=np.uint8) * 255
       contours, _ = cv2.findContours(contour_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
       if contours:
         cv2.drawContours(vis, contours, -1, color=(255, 255, 0), thickness=self.contour_thickness, lineType=cv2.LINE_AA)

@@ -63,6 +63,15 @@ foundationpose:
     output_dir: realtime_foundation/outputs/network_input_capture
     max_samples_per_signature: 1
 
+  # 生产路径关闭每次TensorRT调用后的CPU级全GPU同步；Refiner/Scorer函数边界仍保留同步。
+  network_internal_sync_enabled: false
+
+  # 每帧只扫描一次Mask/Depth，并由中心估计、Depth PCA和Geometry候选筛选共享统计结果。
+  frame_statistics_reuse_enabled: true
+
+  # 注册质量门已生成最终Pose的Render Mask；轮廓显示/记录直接复用，避免相同Pose再次渲染。
+  quality_render_mask_reuse_enabled: true
+
   # 仅用于拆分nvdiffrast渲染内部耗时；会增加CUDA Event和同步开销，正常运行保持关闭。
   render_profile_enabled: false
 

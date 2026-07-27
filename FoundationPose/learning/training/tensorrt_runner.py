@@ -110,6 +110,11 @@ class TensorRTEngineRunner:
       self._last_timing_events = (start, end)
       return outputs
 
+  def pop_last_cuda_timing_events(self) -> tuple[torch.cuda.Event, torch.cuda.Event] | None:
+    events = self._last_timing_events
+    self._last_timing_events = None
+    return events
+
   def collect_last_cuda_timing(self) -> float | None:
     if self._last_timing_events is None:
       return None

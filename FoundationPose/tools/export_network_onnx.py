@@ -91,6 +91,13 @@ def main() -> None:
   parser.add_argument('--dynamic-batch', action='store_true')
   parser.add_argument('--min-batch', type=int)
   parser.add_argument('--max-batch', type=int)
+  parser.add_argument(
+      '--input-size',
+      type=int,
+      nargs=2,
+      metavar=('HEIGHT', 'WIDTH'),
+      help='Override config.input_resize while keeping spatial dimensions fixed in the exported ONNX model.',
+  )
   args = parser.parse_args()
 
   defaults = NETWORK_DEFAULTS[args.network]
@@ -112,7 +119,16 @@ def main() -> None:
   wrapper = build_wrapper(args.network, config, checkpoint_path, batch, args.dynamic_batch)
 
   channels = int(config.c_in)
-  height, width = (int(value) for value in config.input_resize)
+  height, width = (
+      tuple(args.input_size)
+      if args.input_size is not None
+      else tuple(int(value) for value in config.input_resize)
+  )
+  if height <= 0 or width <= 0:
+    raise ValueError(f'input size must be positive, got {(height, width)}')
+  token_count = ((height + 7) // 8) * ((width + 7) // 8)
+  if token_count > 400:
+    raise ValueError(f'input size {(height, width)} produces {token_count} tokens, exceeding positional embedding limit 400')
   torch.manual_seed(20260723)
   A = torch.randn(batch, channels, height, width, dtype=torch.float32)
   B = torch.randn_like(A)
@@ -160,6 +176,8 @@ def main() -> None:
       'network': args.network,
       'batch': batch,
       'input_shape': [batch, channels, height, width],
+      'input_size': [height, width],
+      'input_size_source': 'command_line' if args.input_size is not None else 'model_config',
       'input_dtype': 'float32',
       'outputs': {
         name: {'shape': list(tensor.shape), 'dtype': str(tensor.dtype)}

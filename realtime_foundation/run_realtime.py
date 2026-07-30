@@ -5,8 +5,10 @@ from dataclasses import dataclass
 import json
 import logging
 import os
+from pathlib import Path
 import queue
 import shutil
+import signal
 import threading
 import time
 
@@ -20,6 +22,10 @@ from tracking.foundationpose_tracker import FoundationPoseRealtimeTracker
 
 
 REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+
+
+class TerminationRequested(Exception):
+  pass
 
 
 @dataclass(frozen=True)
@@ -47,8 +53,13 @@ class DetectionMessage:
   depth: np.ndarray
   K: np.ndarray
   detection: object
+  yolo_start_unix_ns: int
+  yolo_end_unix_ns: int
+  yolo_start_monotonic_ns: int
+  yolo_end_monotonic_ns: int
   yolo_time: float
   yolo_timing: dict
+  yolo_candidate_count: int
 
 
 @dataclass(frozen=True)
@@ -190,27 +201,58 @@ class PoseRecordWriter:
 class LatestTopic:
   def __init__(self, name: str):
     self.name = name
-    self.lock = threading.Lock()
+    self.condition = threading.Condition()
     self.message = None
+    self.sequence = 0
 
-  def publish(self, message) -> None:
-    with self.lock:
+  def publish(self, message) -> int:
+    with self.condition:
+      self.sequence += 1
       self.message = message
+      self.condition.notify_all()
+      return self.sequence
 
   def get_latest(self):
-    with self.lock:
+    with self.condition:
       return self.message
 
+  def get_snapshot(self):
+    with self.condition:
+      return self.sequence, self.message
 
-class RealSenseImagePublisher:
-  def __init__(self, camera: RealSenseReader):
+  def wait_for_newer(
+      self,
+      after_sequence: int,
+      stop_event: threading.Event | None = None,
+      timeout: float | None = None,
+  ):
+    with self.condition:
+      self.condition.wait_for(
+          lambda: self.sequence > after_sequence or (stop_event is not None and stop_event.is_set()),
+          timeout=timeout,
+      )
+      if self.sequence <= after_sequence:
+        return None
+      return self.sequence, self.message
+
+  def wake_waiters(self) -> None:
+    with self.condition:
+      self.condition.notify_all()
+
+
+class RgbdImagePublisher:
+  def __init__(self, camera):
     self.camera = camera
     self.image_topic = LatestTopic("/camera/rgbd/latest")
     self.stop_event = threading.Event()
-    self.thread = threading.Thread(target=self._capture_loop, name="realsense-image-publisher", daemon=True)
+    self.thread = threading.Thread(target=self._capture_loop, name="rgbd-image-publisher", daemon=True)
     self.latest_frame_id = 0
+    self.error_lock = threading.Lock()
+    self.error = None
 
   def start(self) -> None:
+    with self.error_lock:
+      self.error = None
     self.camera.start()
     self.thread.start()
 
@@ -221,22 +263,38 @@ class RealSenseImagePublisher:
       self.thread.join(timeout=2.0)
 
   def get_latest(self) -> FrameMessage | None:
+    with self.error_lock:
+      error = self.error
+    if error is not None:
+      raise RuntimeError(f"RGB-D capture thread failed: {error}") from error
     return self.image_topic.get_latest()
 
   def _capture_loop(self) -> None:
-    while not self.stop_event.is_set():
-      frame = self.camera.get_frame()
-      if frame is None:
-        continue
-      color, depth, K = frame
-      self.latest_frame_id += 1
-      self.image_topic.publish(FrameMessage(
-          frame_id=self.latest_frame_id,
-          timestamp=time.time(),
-          color=color,
-          depth=depth,
-          K=K,
-      ))
+    try:
+      while not self.stop_event.is_set():
+        frame = self.camera.get_frame()
+        if frame is None:
+          continue
+        if len(frame) == 3:
+          color, depth, K = frame
+          timestamp = time.time()
+        elif len(frame) == 4:
+          color, depth, K, timestamp = frame
+        else:
+          raise RuntimeError(f"Camera reader returned {len(frame)} values; expected 3 or 4")
+        self.latest_frame_id += 1
+        self.image_topic.publish(FrameMessage(
+            frame_id=self.latest_frame_id,
+            timestamp=float(timestamp),
+            color=color,
+            depth=depth,
+            K=K,
+        ))
+    except Exception as exc:
+      if not self.stop_event.is_set():
+        with self.error_lock:
+          self.error = exc
+        self.stop_event.set()
 
 
 class YoloDetectionWorker:
@@ -253,6 +311,12 @@ class YoloDetectionWorker:
     self.stop_event = threading.Event()
     self.pause_event = threading.Event()
     self.inference_lock = threading.Lock()
+    self.candidate_condition = threading.Condition()
+    self.candidate_search_enabled = True
+    self.pending_candidate_sequence = None
+    self.resolved_candidate_sequence = 0
+    self.error_lock = threading.Lock()
+    self.error = None
     self.thread = threading.Thread(target=self._detect_loop, name="yolo-detection-worker", daemon=True)
     self.last_processed_frame_id = 0
 
@@ -261,8 +325,14 @@ class YoloDetectionWorker:
 
   def stop(self) -> None:
     self.stop_event.set()
+    self.image_topic.wake_waiters()
+    self.detection_topic.wake_waiters()
+    with self.candidate_condition:
+      self.candidate_condition.notify_all()
     if self.thread.is_alive():
       self.thread.join(timeout=2.0)
+    if self.thread.is_alive():
+      print("[Realtime] Warning: YOLO detection thread did not stop within 2.0 s")
 
   def pause(self) -> None:
     self.pause_event.set()
@@ -273,37 +343,116 @@ class YoloDetectionWorker:
     self.pause_event.clear()
 
   def get_latest(self) -> DetectionMessage | None:
+    self.raise_if_failed()
     return self.detection_topic.get_latest()
 
-  def _detect_loop(self) -> None:
-    while not self.stop_event.is_set():
-      if self.pause_event.is_set():
-        time.sleep(0.001)
-        continue
-      frame_message = self.image_topic.get_latest()
-      if frame_message is None or frame_message.frame_id == self.last_processed_frame_id:
-        time.sleep(0.001)
-        continue
-      self.last_processed_frame_id = frame_message.frame_id
-      if frame_message.frame_id % self.frame_stride != 0:
-        continue
+  def get_latest_snapshot(self) -> tuple[int, DetectionMessage | None]:
+    self.raise_if_failed()
+    return self.detection_topic.get_snapshot()
 
-      with self.inference_lock:
+  def wait_for_detection(
+      self,
+      after_sequence: int,
+      timeout: float | None = None,
+  ) -> tuple[int, DetectionMessage] | None:
+    snapshot = self.detection_topic.wait_for_newer(
+        after_sequence,
+        stop_event=self.stop_event,
+        timeout=timeout,
+    )
+    self.raise_if_failed()
+    return snapshot
+
+  def resume_candidate_search(self, candidate_sequence: int) -> None:
+    with self.candidate_condition:
+      self.resolved_candidate_sequence = max(self.resolved_candidate_sequence, candidate_sequence)
+      if self.pending_candidate_sequence == candidate_sequence:
+        self.pending_candidate_sequence = None
+      self.candidate_condition.notify_all()
+
+  def finish_candidate_search(self, candidate_sequence: int) -> None:
+    with self.candidate_condition:
+      self.candidate_search_enabled = False
+      self.resolved_candidate_sequence = max(self.resolved_candidate_sequence, candidate_sequence)
+      self.pending_candidate_sequence = None
+      self.candidate_condition.notify_all()
+
+  def enable_candidate_search(self) -> int:
+    with self.candidate_condition:
+      self.candidate_search_enabled = True
+    sequence, _ = self.detection_topic.get_snapshot()
+    return sequence
+
+  def raise_if_failed(self) -> None:
+    with self.error_lock:
+      error = self.error
+    if error is not None:
+      raise RuntimeError(f"YOLO detection thread failed: {error}") from error
+
+  def _detect_loop(self) -> None:
+    try:
+      while not self.stop_event.is_set():
         if self.pause_event.is_set():
+          time.sleep(0.001)
           continue
-        yolo_start = time.perf_counter()
-        detection = self.detector.predict_mask(frame_message.color)
-        yolo_time = time.perf_counter() - yolo_start
-        self.detection_topic.publish(DetectionMessage(
-            frame_id=frame_message.frame_id,
-            timestamp=frame_message.timestamp,
-            color=frame_message.color,
-            depth=frame_message.depth,
-            K=frame_message.K,
-            detection=detection,
-            yolo_time=yolo_time,
-            yolo_timing=dict(getattr(self.detector, "last_timing", {})),
-        ))
+        frame_message = self.image_topic.get_latest()
+        if frame_message is None or frame_message.frame_id == self.last_processed_frame_id:
+          time.sleep(0.001)
+          continue
+        self.last_processed_frame_id = frame_message.frame_id
+        if frame_message.frame_id % self.frame_stride != 0:
+          continue
+
+        with self.inference_lock:
+          if self.pause_event.is_set():
+            continue
+          yolo_start_unix_ns = time.time_ns()
+          yolo_start_monotonic_ns = time.perf_counter_ns()
+          detection = self.detector.predict_mask(frame_message.color)
+          yolo_end_monotonic_ns = time.perf_counter_ns()
+          yolo_end_unix_ns = time.time_ns()
+          yolo_time = (yolo_end_monotonic_ns - yolo_start_monotonic_ns) / 1_000_000_000.0
+          publication_sequence = self.detection_topic.publish(DetectionMessage(
+              frame_id=frame_message.frame_id,
+              timestamp=frame_message.timestamp,
+              color=frame_message.color,
+              depth=frame_message.depth,
+              K=frame_message.K,
+              detection=detection,
+              yolo_start_unix_ns=yolo_start_unix_ns,
+              yolo_end_unix_ns=yolo_end_unix_ns,
+              yolo_start_monotonic_ns=yolo_start_monotonic_ns,
+              yolo_end_monotonic_ns=yolo_end_monotonic_ns,
+              yolo_time=yolo_time,
+              yolo_timing=dict(getattr(self.detector, "last_timing", {})),
+              yolo_candidate_count=int(getattr(self.detector, "last_candidate_count", 0)),
+          ))
+
+        if detection is not None:
+          self._wait_for_candidate_resolution(publication_sequence)
+    except Exception as exc:
+      if not self.stop_event.is_set():
+        with self.error_lock:
+          self.error = exc
+        self.stop_event.set()
+        self.detection_topic.wake_waiters()
+        with self.candidate_condition:
+          self.candidate_condition.notify_all()
+
+  def _wait_for_candidate_resolution(self, publication_sequence: int) -> None:
+    with self.candidate_condition:
+      if not self.candidate_search_enabled:
+        return
+      self.pending_candidate_sequence = publication_sequence
+      self.candidate_condition.wait_for(
+          lambda: (
+              self.stop_event.is_set()
+              or not self.candidate_search_enabled
+              or self.resolved_candidate_sequence >= publication_sequence
+          )
+      )
+      if self.pending_candidate_sequence == publication_sequence:
+        self.pending_candidate_sequence = None
 
 
 def load_config(path: str) -> dict:
@@ -317,11 +466,48 @@ def resolve_path(path: str | None) -> str | None:
   return os.path.abspath(os.path.join(REPO_ROOT, path))
 
 
+def build_camera_reader(
+  camera_cfg: dict,
+  config_path: str | Path,
+  source_override: str | None = None,
+):
+  source = str(source_override or camera_cfg.get("source", "realsense")).strip().lower()
+  if source == "realsense":
+    return RealSenseReader(
+        width=int(camera_cfg.get("width", 640)),
+        height=int(camera_cfg.get("height", 480)),
+        fps=int(camera_cfg.get("fps", 30)),
+        serial=camera_cfg.get("serial"),
+        depth_min=float(camera_cfg.get("depth_min", 0.001)),
+        depth_max=float(camera_cfg.get("depth_max", 3.0)),
+        align_to_color=bool(camera_cfg.get("align_to_color", True)),
+        reset_before_start=bool(camera_cfg.get("reset_before_start", True)),
+    )
+  if source == "ros2":
+    try:
+      from camera.ros2_rgbd_shm_reader import Ros2RgbdSharedMemoryReader
+    except ImportError as exc:
+      raise RuntimeError(
+          "ROS 2 camera input requires the ROS-derived image and a sourced ROS environment. "
+          "Run with FoundationPose/docker/run_container_jetson_ros2.sh."
+      ) from exc
+    return Ros2RgbdSharedMemoryReader.from_config(
+        config_path=Path(config_path),
+        camera_config=camera_cfg,
+        ros2_config=camera_cfg.get("ros2", {}) or {},
+    )
+  raise ValueError(f"Unsupported camera.source {source!r}; expected 'realsense' or 'ros2'")
+
+
 def resolve_tensorrt_backends(tracker_cfg: dict) -> dict:
   backends = dict(tracker_cfg.get("tensorrt", {}))
   refiner = dict(backends.get("refiner", {}))
   scorer = dict(backends.get("scorer", {}))
   refiner["engine_path"] = resolve_path(refiner.get("engine_path"))
+  refiner["engine_paths"] = {
+      str(network_stage): resolve_path(engine_path)
+      for network_stage, engine_path in dict(refiner.get("engine_paths", {})).items()
+  }
   scorer["engine_paths"] = {
       int(candidate_count): resolve_path(engine_path)
       for candidate_count, engine_path in dict(scorer.get("engine_paths", {})).items()
@@ -329,7 +515,18 @@ def resolve_tensorrt_backends(tracker_cfg: dict) -> dict:
   return {"refiner": refiner, "scorer": scorer}
 
 
-def build_tracker(tracker_cfg: dict) -> FoundationPoseRealtimeTracker:
+def resolve_render_lod_config(tracker_cfg: dict) -> dict:
+  render_lod = dict(tracker_cfg.get("render_lod", {}) or {})
+  render_lod["mesh_file"] = resolve_path(render_lod.get("mesh_file"))
+  comparison = dict(render_lod.get("comparison", {}) or {})
+  comparison["output_dir"] = resolve_path(
+      comparison.get("output_dir", "realtime_foundation/outputs/render_lod_comparison")
+  )
+  render_lod["comparison"] = comparison
+  return render_lod
+
+
+def build_tracker(tracker_cfg: dict, candidate_pipeline_debug_enabled: bool = False) -> FoundationPoseRealtimeTracker:
   return FoundationPoseRealtimeTracker(
       mesh_file=resolve_path(tracker_cfg["mesh_file"]),
       debug_dir=resolve_path(tracker_cfg.get("debug_dir", "realtime_foundation/outputs/frame_records")),
@@ -369,6 +566,7 @@ def build_tracker(tracker_cfg: dict) -> FoundationPoseRealtimeTracker:
       scorer_shared_warp_grid_enabled=bool(tracker_cfg.get("scorer_shared_warp_grid_enabled", False)),
       scorer_skip_unused_depth_warp_enabled=bool(tracker_cfg.get("scorer_skip_unused_depth_warp_enabled", False)),
       tensorrt_backends=resolve_tensorrt_backends(tracker_cfg),
+      refiner_input_sizes=dict(tracker_cfg.get("refiner_input_sizes", {})),
       track_refine_iter=int(tracker_cfg.get("track_refine_iter", 2)),
       vis_mode=tracker_cfg.get("vis_mode", "box"),
       contour_thickness=int(tracker_cfg.get("contour_thickness", 3)),
@@ -376,6 +574,8 @@ def build_tracker(tracker_cfg: dict) -> FoundationPoseRealtimeTracker:
       network_internal_sync_enabled=bool(tracker_cfg.get("network_internal_sync_enabled", True)),
       frame_statistics_reuse_enabled=bool(tracker_cfg.get("frame_statistics_reuse_enabled", False)),
       quality_render_mask_reuse_enabled=bool(tracker_cfg.get("quality_render_mask_reuse_enabled", False)),
+      render_lod=resolve_render_lod_config(tracker_cfg),
+      candidate_pipeline_debug_enabled=bool(candidate_pipeline_debug_enabled),
   )
 
 
@@ -766,12 +966,13 @@ def seconds_to_ms(value):
 
 
 def foundation_register_timing_rows(timing: dict, register_wall_time: float | None = None) -> list[tuple[str, float | str | None]]:
-  refiner_detail = timing.get("refiner_detail", {})
   refiner_coarse_detail = timing.get("refiner_coarse_detail", {})
   refiner_fine_detail = timing.get("refiner_fine_detail", {})
-  scorer_detail = timing.get("scorer_detail", {})
   scorer_coarse_detail = timing.get("scorer_coarse_detail", {})
   scorer_fine_detail = timing.get("scorer_fine_detail", {})
+  scorer_coarse_time = timing.get("scorer_coarse")
+  scorer_coarse_ran = scorer_coarse_time is not None and float(scorer_coarse_time) > 0.0
+  scorer_fine_detail_indent = "      " if scorer_coarse_ran else "    "
   register_time = timing.get("register", register_wall_time)
   rows = [
       ("foundation_total", seconds_to_ms(register_time)),
@@ -826,31 +1027,10 @@ def foundation_register_timing_rows(timing: dict, register_wall_time: float | No
       ("      refiner_fine_pose_update", seconds_to_ms(refiner_fine_detail.get("pose_update"))),
       ("      refiner_fine_empty_cache", seconds_to_ms(refiner_fine_detail.get("empty_cache"))),
       ("      refiner_fine_other", seconds_to_ms(refiner_fine_detail.get("other"))),
-      ("    refiner_crop_window", seconds_to_ms(refiner_detail.get("crop_window"))),
-      ("    refiner_render", seconds_to_ms(refiner_detail.get("render"))),
-      ("    refiner_render_postprocess", seconds_to_ms(refiner_detail.get("render_postprocess"))),
-      ("    refiner_warp", seconds_to_ms(refiner_detail.get("warp"))),
-      ("    refiner_transform", seconds_to_ms(refiner_detail.get("transform"))),
-      ("    refiner_input_pack", seconds_to_ms(refiner_detail.get("input_pack"))),
-      ("    refiner_backend", refiner_detail.get("network_backend")),
-      ("    refiner_network_internal_sync", refiner_detail.get("network_internal_sync_status")),
-      ("    refiner_fallback", refiner_detail.get("fallback_reason")),
-      ("    refiner_network_forward", seconds_to_ms(refiner_detail.get("network_forward"))),
-      ("      refiner_layout_convert", seconds_to_ms(refiner_detail.get("layout_convert"))),
-      ("      refiner_dtype_convert", seconds_to_ms(refiner_detail.get("dtype_convert"))),
-      ("      refiner_tensorrt_execute", seconds_to_ms(refiner_detail.get("tensorrt_execute"))),
-      ("      refiner_output_convert", seconds_to_ms(refiner_detail.get("output_convert"))),
-      ("      refiner_encodeA", seconds_to_ms(refiner_detail.get("encodeA"))),
-      ("      refiner_encodeAB", seconds_to_ms(refiner_detail.get("encodeAB"))),
-      ("      refiner_trans_head", seconds_to_ms(refiner_detail.get("trans_head"))),
-      ("      refiner_rot_head", seconds_to_ms(refiner_detail.get("rot_head"))),
-      ("    refiner_empty_cache", seconds_to_ms(refiner_detail.get("empty_cache"))),
-      ("    refiner_pose_update", seconds_to_ms(refiner_detail.get("pose_update"))),
-      ("    refiner_other", seconds_to_ms(refiner_detail.get("other"))),
+      ("  foundation_coarse_score_select", seconds_to_ms(timing.get("coarse_score_select"))),
+      ("  foundation_coarse_scorer_status", timing.get("coarse_scorer_status")),
       ("  foundation_scorer", seconds_to_ms(timing.get("scorer"))),
-      ("    coarse_score_select", seconds_to_ms(timing.get("coarse_score_select"))),
-      ("    coarse_scorer_status", timing.get("coarse_scorer_status")),
-      ("    scorer_coarse", seconds_to_ms(timing.get("scorer_coarse"))),
+      ("    scorer_coarse", seconds_to_ms(scorer_coarse_time) if scorer_coarse_ran else None),
       ("      scorer_coarse_backend", scorer_coarse_detail.get("network_backend")),
       ("      scorer_coarse_network_internal_sync", scorer_coarse_detail.get("network_internal_sync_status")),
       ("      scorer_coarse_fallback", scorer_coarse_detail.get("fallback_reason")),
@@ -872,52 +1052,28 @@ def foundation_register_timing_rows(timing: dict, register_wall_time: float | No
       ("        scorer_coarse_linear", seconds_to_ms(scorer_coarse_detail.get("linear"))),
       ("      scorer_coarse_empty_cache", seconds_to_ms(scorer_coarse_detail.get("empty_cache"))),
       ("      scorer_coarse_other", seconds_to_ms(scorer_coarse_detail.get("other"))),
-      ("      scorer_coarse_detail_total", seconds_to_ms(scorer_coarse_detail.get("total"))),
-      ("    scorer_fine", seconds_to_ms(timing.get("scorer_fine"))),
-      ("      scorer_fine_backend", scorer_fine_detail.get("network_backend")),
-      ("      scorer_fine_network_internal_sync", scorer_fine_detail.get("network_internal_sync_status")),
-      ("      scorer_fine_fallback", scorer_fine_detail.get("fallback_reason")),
-      ("      scorer_fine_crop_window", seconds_to_ms(scorer_fine_detail.get("crop_window"))),
-      ("      scorer_fine_render", seconds_to_ms(scorer_fine_detail.get("render"))),
-      ("      scorer_fine_render_postprocess", seconds_to_ms(scorer_fine_detail.get("render_postprocess"))),
-      ("      scorer_fine_warp", seconds_to_ms(scorer_fine_detail.get("warp"))),
-      ("      scorer_fine_transform", seconds_to_ms(scorer_fine_detail.get("transform"))),
-      ("      scorer_fine_input_pack", seconds_to_ms(scorer_fine_detail.get("input_pack"))),
-      ("      scorer_fine_network_forward", seconds_to_ms(scorer_fine_detail.get("network_forward"))),
-      ("        scorer_fine_layout_convert", seconds_to_ms(scorer_fine_detail.get("layout_convert"))),
-      ("        scorer_fine_dtype_convert", seconds_to_ms(scorer_fine_detail.get("dtype_convert"))),
-      ("        scorer_fine_tensorrt_execute", seconds_to_ms(scorer_fine_detail.get("tensorrt_execute"))),
-      ("        scorer_fine_output_convert", seconds_to_ms(scorer_fine_detail.get("output_convert"))),
-      ("        scorer_fine_encoderA", seconds_to_ms(scorer_fine_detail.get("encoderA"))),
-      ("        scorer_fine_encoderAB", seconds_to_ms(scorer_fine_detail.get("encoderAB"))),
-      ("        scorer_fine_self_attention", seconds_to_ms(scorer_fine_detail.get("self_attention"))),
-      ("        scorer_fine_cross_attention", seconds_to_ms(scorer_fine_detail.get("cross_attention"))),
-      ("        scorer_fine_linear", seconds_to_ms(scorer_fine_detail.get("linear"))),
-      ("      scorer_fine_empty_cache", seconds_to_ms(scorer_fine_detail.get("empty_cache"))),
-      ("      scorer_fine_other", seconds_to_ms(scorer_fine_detail.get("other"))),
-      ("      scorer_fine_detail_total", seconds_to_ms(scorer_fine_detail.get("total"))),
-      ("    scorer_crop_window", seconds_to_ms(scorer_detail.get("crop_window"))),
-      ("    scorer_render", seconds_to_ms(scorer_detail.get("render"))),
-      ("    scorer_render_postprocess", seconds_to_ms(scorer_detail.get("render_postprocess"))),
-      ("    scorer_warp", seconds_to_ms(scorer_detail.get("warp"))),
-      ("    scorer_transform", seconds_to_ms(scorer_detail.get("transform"))),
-      ("    scorer_input_pack", seconds_to_ms(scorer_detail.get("input_pack"))),
-      ("    scorer_backend", scorer_detail.get("network_backend")),
-      ("    scorer_network_internal_sync", scorer_detail.get("network_internal_sync_status")),
-      ("    scorer_fallback", scorer_detail.get("fallback_reason")),
-      ("    scorer_network_forward", seconds_to_ms(scorer_detail.get("network_forward"))),
-      ("      scorer_layout_convert", seconds_to_ms(scorer_detail.get("layout_convert"))),
-      ("      scorer_dtype_convert", seconds_to_ms(scorer_detail.get("dtype_convert"))),
-      ("      scorer_tensorrt_execute", seconds_to_ms(scorer_detail.get("tensorrt_execute"))),
-      ("      scorer_output_convert", seconds_to_ms(scorer_detail.get("output_convert"))),
-      ("      scorer_encoderA", seconds_to_ms(scorer_detail.get("encoderA"))),
-      ("      scorer_encoderAB", seconds_to_ms(scorer_detail.get("encoderAB"))),
-      ("      scorer_self_attention", seconds_to_ms(scorer_detail.get("self_attention"))),
-      ("      scorer_cross_attention", seconds_to_ms(scorer_detail.get("cross_attention"))),
-      ("      scorer_linear", seconds_to_ms(scorer_detail.get("linear"))),
-      ("    scorer_empty_cache", seconds_to_ms(scorer_detail.get("empty_cache"))),
-      ("    scorer_other", seconds_to_ms(scorer_detail.get("other"))),
-      ("    scorer_detail_total", seconds_to_ms(scorer_detail.get("total"))),
+      ("    scorer_fine", seconds_to_ms(timing.get("scorer_fine")) if scorer_coarse_ran else None),
+      (f"{scorer_fine_detail_indent}scorer_fine_backend", scorer_fine_detail.get("network_backend")),
+      (f"{scorer_fine_detail_indent}scorer_fine_network_internal_sync", scorer_fine_detail.get("network_internal_sync_status")),
+      (f"{scorer_fine_detail_indent}scorer_fine_fallback", scorer_fine_detail.get("fallback_reason")),
+      (f"{scorer_fine_detail_indent}scorer_fine_crop_window", seconds_to_ms(scorer_fine_detail.get("crop_window"))),
+      (f"{scorer_fine_detail_indent}scorer_fine_render", seconds_to_ms(scorer_fine_detail.get("render"))),
+      (f"{scorer_fine_detail_indent}scorer_fine_render_postprocess", seconds_to_ms(scorer_fine_detail.get("render_postprocess"))),
+      (f"{scorer_fine_detail_indent}scorer_fine_warp", seconds_to_ms(scorer_fine_detail.get("warp"))),
+      (f"{scorer_fine_detail_indent}scorer_fine_transform", seconds_to_ms(scorer_fine_detail.get("transform"))),
+      (f"{scorer_fine_detail_indent}scorer_fine_input_pack", seconds_to_ms(scorer_fine_detail.get("input_pack"))),
+      (f"{scorer_fine_detail_indent}scorer_fine_network_forward", seconds_to_ms(scorer_fine_detail.get("network_forward"))),
+      (f"{scorer_fine_detail_indent}  scorer_fine_layout_convert", seconds_to_ms(scorer_fine_detail.get("layout_convert"))),
+      (f"{scorer_fine_detail_indent}  scorer_fine_dtype_convert", seconds_to_ms(scorer_fine_detail.get("dtype_convert"))),
+      (f"{scorer_fine_detail_indent}  scorer_fine_tensorrt_execute", seconds_to_ms(scorer_fine_detail.get("tensorrt_execute"))),
+      (f"{scorer_fine_detail_indent}  scorer_fine_output_convert", seconds_to_ms(scorer_fine_detail.get("output_convert"))),
+      (f"{scorer_fine_detail_indent}  scorer_fine_encoderA", seconds_to_ms(scorer_fine_detail.get("encoderA"))),
+      (f"{scorer_fine_detail_indent}  scorer_fine_encoderAB", seconds_to_ms(scorer_fine_detail.get("encoderAB"))),
+      (f"{scorer_fine_detail_indent}  scorer_fine_self_attention", seconds_to_ms(scorer_fine_detail.get("self_attention"))),
+      (f"{scorer_fine_detail_indent}  scorer_fine_cross_attention", seconds_to_ms(scorer_fine_detail.get("cross_attention"))),
+      (f"{scorer_fine_detail_indent}  scorer_fine_linear", seconds_to_ms(scorer_fine_detail.get("linear"))),
+      (f"{scorer_fine_detail_indent}scorer_fine_empty_cache", seconds_to_ms(scorer_fine_detail.get("empty_cache"))),
+      (f"{scorer_fine_detail_indent}scorer_fine_other", seconds_to_ms(scorer_fine_detail.get("other"))),
       ("  foundation_topk_select", seconds_to_ms(timing.get("topk_select"))),
       ("  foundation_sort_select", seconds_to_ms(timing.get("sort_select"))),
       ("  foundation_other", seconds_to_ms(timing.get("other"))),
@@ -928,8 +1084,6 @@ def foundation_register_timing_rows(timing: dict, register_wall_time: float | No
       "refiner_fine": refiner_fine_detail,
       "scorer_coarse": scorer_coarse_detail,
       "scorer_fine": scorer_fine_detail,
-      "refiner": refiner_detail,
-      "scorer": scorer_detail,
   }
   network_detail_suffixes = {
       "layout_convert",
@@ -1003,6 +1157,10 @@ def foundation_register_timing_rows(timing: dict, register_wall_time: float | No
       backend = detail.get("network_backend")
       if suffix == "backend":
         continue
+      if suffix == "network_internal_sync" and value == "disabled":
+        continue
+      if suffix == "empty_cache" and (value is None or float(value) == 0.0):
+        continue
       if suffix == "fallback" and not value:
         continue
       if suffix == "render" and matched_prefix in render_profile_prefixes:
@@ -1044,14 +1202,22 @@ def foundation_register_timing_rows(timing: dict, register_wall_time: float | No
 
 def foundation_candidate_stage_rows(timing: dict) -> list[tuple[str, int | None, float | None]]:
   if "refiner_coarse_candidates" in timing:
-    return [
+    rows = [
         ("pose_hypothesis_generated", timing.get("pose_hypothesis_candidates"), timing.get("pose_hypothesis")),
         ("axis_prior_after", timing.get("axis_prior_candidates_after"), timing.get("axis_prior")),
         ("refiner_coarse_input", timing.get("refiner_coarse_candidates"), timing.get("refiner_coarse")),
-        ("scorer_coarse_input", timing.get("scorer_coarse_candidates"), timing.get("scorer_coarse")),
-        ("refiner_fine_input", timing.get("refiner_fine_candidates"), timing.get("refiner_fine")),
-        ("scorer_fine_input", timing.get("scorer_fine_candidates"), timing.get("scorer_fine")),
     ]
+    if float(timing.get("scorer_coarse", 0.0) or 0.0) > 0.0:
+      rows.append(
+          ("scorer_coarse_input", timing.get("scorer_coarse_candidates"), timing.get("scorer_coarse"))
+      )
+    rows.extend(
+        (
+            ("refiner_fine_input", timing.get("refiner_fine_candidates"), timing.get("refiner_fine")),
+            ("scorer_fine_input", timing.get("scorer_fine_candidates"), timing.get("scorer_fine")),
+        )
+    )
+    return rows
   return [
       ("pose_hypothesis_generated", timing.get("pose_hypothesis_candidates"), timing.get("pose_hypothesis")),
       ("axis_prior_after", timing.get("axis_prior_candidates_after"), timing.get("axis_prior")),
@@ -1077,16 +1243,13 @@ def print_foundation_candidate_summary(init_index: int, timing: dict) -> None:
   print(
       f"[PCA][SUMMARY][foundationpose_init] init={init_index} "
       f"status={status} filter={timing.get('axis_prior_filter', 'unknown')} "
-      f"points={int(timing.get('axis_prior_points', 0))} confidence={confidence_text} "
+      f"points={int(timing.get('axis_prior_points', 0))} "
+      f"confidence={confidence_text}/{confidence_threshold_text} passed={confidence_passed} "
+      f"eigenvalues={eigenvalues_text} "
       f"model_axis={timing.get('axis_prior_model_axis')} max_angle_deg={timing.get('axis_prior_max_angle_deg')} "
       f"min_candidates={timing.get('axis_prior_min_candidates')} "
       f"max_candidates={timing.get('axis_prior_max_candidates_config')}"
   )
-  print(
-      f"[PCA][CONFIDENCE] actual={confidence_text} "
-      f"threshold={confidence_threshold_text} passed={confidence_passed} status={status}"
-  )
-  print(f"[PCA][EIGENVALUES] {eigenvalues_text}")
 
   stage_width = 31
   count_width = 10
@@ -1151,6 +1314,7 @@ def log_runtime(enabled: bool, message: str) -> None:
 def main() -> None:
   parser = argparse.ArgumentParser()
   parser.add_argument("--config", default=os.path.join(os.path.dirname(__file__), "config.yaml"))
+  parser.add_argument("--camera-source", choices=("realsense", "ros2"), default=None)
   args = parser.parse_args()
   cfg = load_config(args.config)
 
@@ -1163,16 +1327,13 @@ def main() -> None:
   success_timing_only = bool(runtime_cfg.get("success_timing_only", False))
   verbose_runtime = not success_timing_only
 
-  camera = RealSenseReader(
-      width=int(camera_cfg.get("width", 640)),
-      height=int(camera_cfg.get("height", 480)),
-      fps=int(camera_cfg.get("fps", 30)),
-      serial=camera_cfg.get("serial"),
-      depth_min=float(camera_cfg.get("depth_min", 0.001)),
-      depth_max=float(camera_cfg.get("depth_max", 3.0)),
-      align_to_color=bool(camera_cfg.get("align_to_color", True)),
-      reset_before_start=bool(camera_cfg.get("reset_before_start", True)),
+  camera = build_camera_reader(
+      camera_cfg,
+      config_path=args.config,
+      source_override=args.camera_source,
   )
+  if hasattr(camera, "apply_model_cpu_affinity"):
+    camera.apply_model_cpu_affinity()
   yolo_imgsz = yolo_cfg.get("imgsz", 640)
   detector = YoloSegmenter(
       weights=resolve_path(yolo_cfg["weights"]),
@@ -1184,6 +1345,10 @@ def main() -> None:
       half=bool(yolo_cfg.get("half", True)),
       min_mask_area=int(yolo_cfg.get("min_mask_area", 100)),
       morph_kernel=int(yolo_cfg.get("morph_kernel", 5)),
+      execution_path=str(yolo_cfg.get("execution_path", "legacy")),
+      profile_stages=bool(yolo_cfg.get("profile_stages", False)),
+      fallback_to_legacy=bool(yolo_cfg.get("fallback_to_legacy", True)),
+      postprocess_backend=str(yolo_cfg.get("postprocess_backend", "gpu")),
   )
   tracker = build_tracker(tracker_cfg)
   if success_timing_only:
@@ -1218,8 +1383,9 @@ def main() -> None:
 
   frame_index = 0
   last_processed_frame_id = 0
-  last_processed_detection_frame_id = 0
+  last_processed_detection_sequence = 0
   last_tracking_detection_frame_id = 0
+  last_tracking_detection_sequence = 0
   init_count = 0
   last_success_time = None
   last_detection = None
@@ -1227,8 +1393,7 @@ def main() -> None:
   missing_detection_count = 0
   register_stable_areas = []
   next_register_frame = 0
-  frame_publisher = RealSenseImagePublisher(camera)
-  frame_publisher.start()
+  frame_publisher = RgbdImagePublisher(camera)
   sync_recorded_tracking = record_writer is not None and record_save_track and record_require_same_frame_mask
   default_yolo_worker_frame_stride = 1 if init_only or sync_recorded_tracking else max(1, detection_interval)
   yolo_worker = YoloDetectionWorker(
@@ -1236,45 +1401,45 @@ def main() -> None:
       image_topic=frame_publisher.image_topic,
       frame_stride=int(runtime_cfg.get("yolo_worker_frame_stride", default_yolo_worker_frame_stride)),
   )
-  yolo_worker.start()
+
+  def request_termination(signum, _frame):
+    raise TerminationRequested(f"received signal {signum}")
+
+  previous_sigterm_handler = signal.getsignal(signal.SIGTERM)
+  signal.signal(signal.SIGTERM, request_termination)
   try:
+    frame_publisher.start()
+    yolo_worker.start()
     while True:
-      frame_message = frame_publisher.get_latest()
-      if frame_message is None or frame_message.frame_id == last_processed_frame_id:
-        time.sleep(0.001)
-        continue
-      last_processed_frame_id = frame_message.frame_id
-      color, depth, K = frame_message.color, frame_message.depth, frame_message.K
-      frame_index = frame_message.frame_id
-      processed_timestamp = frame_message.timestamp
       reset_tracker_after_record = False
       current_frame_detection = None
       quality_rendered_mask = None
+      initializing = not tracker.initialized
 
-      if not tracker.initialized:
-        detection_message = yolo_worker.get_latest()
-        if detection_message is None or detection_message.frame_id == last_processed_detection_frame_id:
-          if show_window:
-            cv2.imshow("realtime_foundation", color[..., ::-1])
-            if cv2.waitKey(1) in (27, ord("q")):
-              break
+      if initializing:
+        detection_snapshot = yolo_worker.wait_for_detection(
+            last_processed_detection_sequence,
+            timeout=0.1,
+        )
+        if detection_snapshot is None:
+          # Surface camera-thread failures while waiting for YOLO. Normal
+          # delivery wakes the condition immediately; this timeout is only a
+          # health check and does not gate detection on another camera frame.
+          frame_publisher.get_latest()
           continue
-        last_processed_detection_frame_id = detection_message.frame_id
+        detection_sequence, detection_message = detection_snapshot
+        last_processed_detection_sequence = detection_sequence
         frame_index = detection_message.frame_id
+        last_processed_frame_id = frame_index
         color, depth, K = detection_message.color, detection_message.depth, detection_message.K
         processed_timestamp = detection_message.timestamp
-
-        if frame_index < next_register_frame:
-          if show_window:
-            cv2.imshow("realtime_foundation", color[..., ::-1])
-            if cv2.waitKey(1) in (27, ord("q")):
-              break
-          continue
-
         detection = detection_message.detection
         yolo_time = detection_message.yolo_time
         yolo_timing = detection_message.yolo_timing
-        init_start = time.perf_counter() - yolo_time
+        yolo_candidate_count = detection_message.yolo_candidate_count
+        detection_consumed_unix_ns = time.time_ns()
+        detection_consumed_monotonic_ns = time.perf_counter_ns()
+        init_start_monotonic_ns = detection_message.yolo_start_monotonic_ns
         current_frame_detection = detection
         if detection is None:
           register_stable_areas.clear()
@@ -1286,6 +1451,25 @@ def main() -> None:
               break
           continue
 
+        if frame_index < next_register_frame:
+          if show_window:
+            cv2.imshow("realtime_foundation", color[..., ::-1])
+            if cv2.waitKey(1) in (27, ord("q")):
+              break
+          yolo_worker.resume_candidate_search(detection_sequence)
+          continue
+
+      else:
+        frame_message = frame_publisher.get_latest()
+        if frame_message is None or frame_message.frame_id == last_processed_frame_id:
+          time.sleep(0.001)
+          continue
+        last_processed_frame_id = frame_message.frame_id
+        color, depth, K = frame_message.color, frame_message.depth, frame_message.K
+        frame_index = frame_message.frame_id
+        processed_timestamp = frame_message.timestamp
+
+      if initializing:
         validation_start = time.perf_counter()
         valid_depth_pixels = count_valid_depth_pixels(depth, detection.mask)
         log_runtime(
@@ -1301,6 +1485,7 @@ def main() -> None:
             cv2.imshow("realtime_foundation", color[..., ::-1])
             if cv2.waitKey(1) in (27, ord("q")):
               break
+          yolo_worker.resume_candidate_search(detection_sequence)
           continue
         if valid_depth_pixels < min_valid_depth_pixels:
           register_stable_areas.clear()
@@ -1313,6 +1498,7 @@ def main() -> None:
             cv2.imshow("realtime_foundation", color[..., ::-1])
             if cv2.waitKey(1) in (27, ord("q")):
               break
+          yolo_worker.resume_candidate_search(detection_sequence)
           continue
 
         border_reject_reason = detection_border_reject_reason(detection, color.shape[:2], register_border_margin)
@@ -1323,6 +1509,7 @@ def main() -> None:
             cv2.imshow("realtime_foundation", color[..., ::-1])
             if cv2.waitKey(1) in (27, ord("q")):
               break
+          yolo_worker.resume_candidate_search(detection_sequence)
           continue
 
         stability_reject_reason = register_stability_reject_reason(
@@ -1337,6 +1524,7 @@ def main() -> None:
             cv2.imshow("realtime_foundation", color[..., ::-1])
             if cv2.waitKey(1) in (27, ord("q")):
               break
+          yolo_worker.resume_candidate_search(detection_sequence)
           continue
 
         last_detection = detection
@@ -1344,45 +1532,50 @@ def main() -> None:
         register_stable_areas.clear()
         validation_time = time.perf_counter() - validation_start
         log_runtime(verbose_runtime, f"[Realtime] Frame {frame_index}: registering FoundationPose")
+        # Keep YOLO off the GPU for the complete registration GPU phase. In
+        # particular, registration-quality rendering must finish before the
+        # detection worker is resumed, otherwise both workloads contend on
+        # the single Orin GPU and inflate each other's latency.
+        yolo_worker.pause()
         try:
-          yolo_worker.pause()
-          register_start = time.perf_counter()
-          pose_result = tracker.register(color, depth, K, detection.mask)
-          register_wall_time = time.perf_counter() - register_start
-        except Exception as exc:
-          tracker.reset()
-          next_register_frame = frame_index + register_retry_interval
-          log_runtime(verbose_runtime, f"[Realtime] Frame {frame_index}: register failed, waiting for next detection: {exc}")
-          log_runtime(verbose_runtime, f"[Realtime] Frame {frame_index}: retry register after frame {next_register_frame}")
-          continue
+          try:
+            register_start_unix_ns = time.time_ns()
+            register_start = time.perf_counter()
+            pose_result = tracker.register(color, depth, K, detection.mask)
+            register_wall_time = time.perf_counter() - register_start
+            register_end_unix_ns = time.time_ns()
+          except Exception as exc:
+            tracker.reset()
+            next_register_frame = frame_index + register_retry_interval
+            log_runtime(verbose_runtime, f"[Realtime] Frame {frame_index}: register failed, waiting for next detection: {exc}")
+            log_runtime(verbose_runtime, f"[Realtime] Frame {frame_index}: retry register after frame {next_register_frame}")
+            yolo_worker.resume_candidate_search(detection_sequence)
+            continue
+          timing = getattr(tracker.estimator, "last_register_timing", {})
+          if record_writer is not None and record_save_topk_poses:
+            try:
+              topk_record = build_topk_pose_record(
+                  tracker=tracker,
+                  color=color,
+                  K=K,
+                  target_mask=detection.mask,
+                  frame_id=frame_index,
+                  count=record_topk_pose_count,
+              )
+              if topk_record is not None:
+                record_writer.submit(topk_record)
+            except Exception as exc:
+              print(f"[TopK] Frame {frame_index}: failed to build ranked pose diagnostics: {exc}")
+          quality_result = evaluate_register_quality(
+              tracker=tracker,
+              pose=pose_result.pose,
+              depth=depth,
+              K=K,
+              mask=detection.mask,
+              runtime_cfg=runtime_cfg,
+            )
         finally:
           yolo_worker.resume()
-        timing = getattr(tracker.estimator, "last_register_timing", {})
-        if record_writer is not None and record_save_topk_poses:
-          try:
-            yolo_worker.pause()
-            topk_record = build_topk_pose_record(
-                tracker=tracker,
-                color=color,
-                K=K,
-                target_mask=detection.mask,
-                frame_id=frame_index,
-                count=record_topk_pose_count,
-            )
-            if topk_record is not None:
-              record_writer.submit(topk_record)
-          except Exception as exc:
-            print(f"[TopK] Frame {frame_index}: failed to build ranked pose diagnostics: {exc}")
-          finally:
-            yolo_worker.resume()
-        quality_result = evaluate_register_quality(
-            tracker=tracker,
-            pose=pose_result.pose,
-            depth=depth,
-            K=K,
-            mask=detection.mask,
-            runtime_cfg=runtime_cfg,
-        )
         if tracker.quality_render_mask_reuse_enabled:
           quality_rendered_mask = quality_result.rendered_mask
         if not quality_result.accepted:
@@ -1394,20 +1587,49 @@ def main() -> None:
               f"score_gap={quality_result.top1_top2_score_gap}",
           )
           tracker.reset()
+          yolo_worker.resume_candidate_search(detection_sequence)
           continue
+        if not init_only:
+          yolo_worker.finish_candidate_search(detection_sequence)
         init_count += 1
         last_tracking_detection_frame_id = frame_index
-        init_total_time = time.perf_counter() - init_start
+        last_tracking_detection_sequence = detection_sequence
+        init_success_monotonic_ns = time.perf_counter_ns()
+        init_success_unix_ns = time.time_ns()
+        init_total_time = (init_success_monotonic_ns - init_start_monotonic_ns) / 1_000_000_000.0
+        detection_consume_delay = max(
+          0.0,
+          (detection_consumed_monotonic_ns - detection_message.yolo_end_monotonic_ns)
+          / 1_000_000_000.0,
+        )
+        yolo_total_value = yolo_timing.get("total")
+        yolo_total_time = float(yolo_time if yolo_total_value is None else yolo_total_value)
+        foundation_total_value = timing.get("register")
+        foundation_total_time = float(
+          register_wall_time if foundation_total_value is None else foundation_total_value
+        )
+        yolo_foundation_compute_total_time = yolo_total_time + foundation_total_time
         success_time = time.perf_counter()
         success_period = None if last_success_time is None else success_time - last_success_time
         last_success_time = success_time
         success_hz = None if success_period is None else 1.0 / max(success_period, 1e-6)
         log_runtime(verbose_runtime, f"[Realtime] Frame {frame_index}: FoundationPose initialized")
+        print(
+          f"[EVENT][foundationpose_init] schema=1 init={init_count} frame={frame_index} "
+          f"camera_timestamp={processed_timestamp:.9f} "
+          f"yolo_start_unix_ns={detection_message.yolo_start_unix_ns} "
+          f"yolo_end_unix_ns={detection_message.yolo_end_unix_ns} "
+          f"detection_consumed_unix_ns={detection_consumed_unix_ns} "
+          f"register_start_unix_ns={register_start_unix_ns} "
+          f"register_end_unix_ns={register_end_unix_ns} "
+          f"init_success_unix_ns={init_success_unix_ns}"
+        )
         print_foundation_candidate_summary(init_count, timing)
         print_timing_summary(
             init_count,
             [
-                ("yolo_total", seconds_to_ms(yolo_timing.get("total", yolo_time))),
+              ("yolo_total", seconds_to_ms(yolo_total_time)),
+                ("yolo_candidate_count", str(yolo_candidate_count)),
                 ("  yolo_model_predict", seconds_to_ms(yolo_timing.get("model_predict"))),
               ("    yolo_preprocess", seconds_to_ms(yolo_timing.get("model_preprocess"))),
               ("    yolo_inference", seconds_to_ms(yolo_timing.get("model_inference"))),
@@ -1416,28 +1638,45 @@ def main() -> None:
                 ("  yolo_tensor_to_cpu", seconds_to_ms(yolo_timing.get("tensor_to_cpu"))),
                 ("  yolo_mask_resize_clean", seconds_to_ms(yolo_timing.get("mask_resize_clean"))),
                 ("  yolo_select_best_mask", seconds_to_ms(yolo_timing.get("select_best_mask"))),
+                ("  detection_consume_delay", seconds_to_ms(detection_consume_delay)),
                 ("", None),
                 *foundation_register_timing_rows(timing, register_wall_time),
                 ("", None),
+                ("yolo_foundation_compute_total", seconds_to_ms(yolo_foundation_compute_total_time)),
                 ("init_total", seconds_to_ms(init_total_time)),
                 ("success_period", seconds_to_ms(success_period)),
                 ("-" * 57, None),
                 ("success_rate_hz", success_hz),
             ],
         )
+        try:
+          tracker.save_render_lod_comparison(
+              color=color,
+              K=K,
+              frame_id=frame_index,
+          )
+        except Exception as exc:
+          print(f"[RenderLOD] Frame {frame_index}: failed to save runtime comparison: {exc}")
       else:
         if sync_recorded_tracking:
-          detection_message = yolo_worker.get_latest()
-          if detection_message is None or detection_message.frame_id == last_tracking_detection_frame_id:
+          detection_sequence, detection_message = yolo_worker.get_latest_snapshot()
+          if detection_message is None or detection_sequence <= last_tracking_detection_sequence:
             continue
+          last_tracking_detection_sequence = detection_sequence
           last_tracking_detection_frame_id = detection_message.frame_id
           detection = detection_message.detection
           if detection is None:
             missing_detection_count += 1
             if missing_detection_count >= max_missing_detections:
-              tracker.reset()
-              last_detection = None
-              missing_detection_count = 0
+              yolo_worker.pause()
+              try:
+                tracker.reset()
+                last_detection = None
+                missing_detection_count = 0
+                register_stable_areas.clear()
+                last_processed_detection_sequence = yolo_worker.enable_candidate_search()
+              finally:
+                yolo_worker.resume()
             continue
           missing_detection_count = 0
           last_detection = detection
@@ -1448,15 +1687,24 @@ def main() -> None:
         try:
           pose_result = tracker.track(color, depth, K)
         except Exception as exc:
-          tracker.reset()
+          yolo_worker.pause()
+          try:
+            tracker.reset()
+            last_detection = None
+            missing_detection_count = 0
+            register_stable_areas.clear()
+            last_processed_detection_sequence = yolo_worker.enable_candidate_search()
+          finally:
+            yolo_worker.resume()
           log_runtime(verbose_runtime, f"[Realtime] Frame {frame_index}: tracking failed, waiting for detection: {exc}")
           continue
         if not sync_recorded_tracking and should_check_detection(frame_index, detection_interval):
-          detection_message = yolo_worker.get_latest()
-          if detection_message is None or detection_message.frame_id == last_tracking_detection_frame_id:
+          detection_sequence, detection_message = yolo_worker.get_latest_snapshot()
+          if detection_message is None or detection_sequence <= last_tracking_detection_sequence:
             current_frame_detection = None
             log_runtime(verbose_runtime, f"[Realtime] Frame {frame_index}: waiting for a new YOLO detection message during tracking")
           else:
+            last_tracking_detection_sequence = detection_sequence
             last_tracking_detection_frame_id = detection_message.frame_id
             detection = detection_message.detection
             current_frame_detection = detection if detection_message.frame_id == frame_index else None
@@ -1523,21 +1771,30 @@ def main() -> None:
         last_detection = None
         missing_detection_count = 0
         register_stable_areas.clear()
+        yolo_worker.resume_candidate_search(detection_sequence)
         continue
 
       if reset_tracker_after_record:
-        tracker.reset()
-        missing_detection_count = 0
-        register_stable_areas.clear()
+        yolo_worker.pause()
+        try:
+          tracker.reset()
+          missing_detection_count = 0
+          register_stable_areas.clear()
+          last_processed_detection_sequence = yolo_worker.enable_candidate_search()
+        finally:
+          yolo_worker.resume()
         continue
 
       time.sleep(float(runtime_cfg.get("loop_sleep", 0.0)))
+  except TerminationRequested as exc:
+    print(f"[Realtime] {exc}; stopping")
   finally:
     yolo_worker.stop()
     frame_publisher.stop()
     if record_writer is not None:
       record_writer.stop()
     cv2.destroyAllWindows()
+    signal.signal(signal.SIGTERM, previous_sigterm_handler)
 
 
 if __name__ == "__main__":

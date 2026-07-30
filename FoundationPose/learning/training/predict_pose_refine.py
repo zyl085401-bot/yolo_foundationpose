@@ -60,11 +60,13 @@ def finalize_cuda_stage_timing(timing):
 @torch.inference_mode()
 def make_crop_data_batch(render_size, ob_in_cams, mesh, rgb, depth, K, crop_ratio, xyz_map, normal_map=None, mesh_diameter=None, cfg=None, glctx=None, mesh_tensors=None, dataset:PoseRefinePairH5Dataset=None, timing=None):
   logging.info("Welcome make_crop_data_batch")
+  render_size = tuple(int(value) for value in render_size)
+  render_height, render_width = render_size
   H,W = depth.shape[:2]
   args = []
   method = 'box_3d'
   stage_start = start_cuda_stage_timing(timing)
-  tf_to_crops = compute_crop_window_tf_batch(pts=mesh.vertices, H=H, W=W, poses=ob_in_cams, K=K, crop_ratio=crop_ratio, out_size=(render_size[1], render_size[0]), method=method, mesh_diameter=mesh_diameter)
+  tf_to_crops = compute_crop_window_tf_batch(pts=mesh.vertices, H=H, W=W, poses=ob_in_cams, K=K, crop_ratio=crop_ratio, out_size=(render_width, render_height), method=method, mesh_diameter=mesh_diameter)
   finish_cuda_stage_timing(timing, 'crop_window', stage_start)
 
   logging.info("make tf_to_crops done")
@@ -78,7 +80,7 @@ def make_crop_data_batch(render_size, ob_in_cams, mesh, rgb, depth, K, crop_rati
   normal_rs = []
   xyz_map_rs = []
 
-  bbox2d_crop = torch.as_tensor(np.array([0, 0, cfg['input_resize'][0]-1, cfg['input_resize'][1]-1]).reshape(2,2), device='cuda', dtype=torch.float)
+  bbox2d_crop = torch.as_tensor(np.array([0, 0, render_width-1, render_height-1]).reshape(2,2), device='cuda', dtype=torch.float)
   crop_to_oris = tf_to_crops.inverse()
   bbox2d_ori = transform_pts(bbox2d_crop, crop_to_oris).reshape(-1,4)
   render_timing = timing if timing is not None and bool(cfg.get('render_profile_enabled', False)) else None
@@ -86,7 +88,7 @@ def make_crop_data_batch(render_size, ob_in_cams, mesh, rgb, depth, K, crop_rati
   stage_start = start_cuda_stage_timing(timing)
   for b in range(0,len(poseA),bs):
     extra = {}
-    rgb_r, depth_r, normal_r = nvdiffrast_render(K=K, H=H, W=W, ob_in_cams=poseA[b:b+bs], context='cuda', get_normal=cfg['use_normal'], glctx=glctx, mesh_tensors=mesh_tensors, output_size=cfg['input_resize'], bbox2d=bbox2d_ori[b:b+bs], use_light=True, extra=extra, render_timing=render_timing, batched_matmul_enabled=bool(cfg.get('render_batched_matmul_enabled', False)))
+    rgb_r, depth_r, normal_r = nvdiffrast_render(K=K, H=H, W=W, ob_in_cams=poseA[b:b+bs], context='cuda', get_normal=cfg['use_normal'], glctx=glctx, mesh_tensors=mesh_tensors, output_size=render_size, bbox2d=bbox2d_ori[b:b+bs], use_light=True, extra=extra, render_timing=render_timing, batched_matmul_enabled=bool(cfg.get('render_batched_matmul_enabled', False)))
     rgb_rs.append(rgb_r)
     depth_rs.append(depth_r[...,None])
     normal_rs.append(normal_r)
@@ -113,11 +115,11 @@ def make_crop_data_batch(render_size, ob_in_cams, mesh, rgb, depth, K, crop_rati
     rgbBs = warp_perspective_from_grid(rgbB_source, shared_warp_grid, mode='bilinear')
   else:
     rgbBs = kornia.geometry.transform.warp_perspective(rgbB_source, tf_to_crops, dsize=render_size, mode='bilinear', align_corners=False)
-  if rgb_rs.shape[-2:]!=cfg['input_resize']:
+  if tuple(rgb_rs.shape[-2:])!=render_size:
     rgbAs = kornia.geometry.transform.warp_perspective(rgb_rs, tf_to_crops, dsize=render_size, mode='bilinear', align_corners=False)
   else:
     rgbAs = rgb_rs
-  if xyz_map_rs.shape[-2:]!=cfg['input_resize']:
+  if tuple(xyz_map_rs.shape[-2:])!=render_size:
     xyz_mapAs = kornia.geometry.transform.warp_perspective(xyz_map_rs, tf_to_crops, dsize=render_size, mode='nearest', align_corners=False)
   else:
     xyz_mapAs = xyz_map_rs
@@ -155,7 +157,7 @@ def make_crop_data_batch(render_size, ob_in_cams, mesh, rgb, depth, K, crop_rati
 
 
 class PoseRefinePredictor:
-  def __init__(self, network_input_capture=None, tensorrt_backend=None, render_profile_enabled=False, render_batched_matmul_enabled=False, refiner_stage1_optimizations_enabled=False, refiner_shared_warp_grid_enabled=False, network_internal_sync_enabled=True):
+  def __init__(self, network_input_capture=None, tensorrt_backend=None, input_sizes=None, render_profile_enabled=False, render_batched_matmul_enabled=False, refiner_stage1_optimizations_enabled=False, refiner_shared_warp_grid_enabled=False, network_internal_sync_enabled=True):
     logging.info("welcome")
     self.amp = True
     self.run_name = "2023-10-28-18-33-37"
@@ -202,6 +204,12 @@ class PoseRefinePredictor:
       self.cfg['zfar'] = np.inf
     if 'normal_uint8' not in self.cfg:
       self.cfg['normal_uint8'] = False
+    self.default_input_size = self._normalize_input_size(self.cfg['input_resize'], 'default')
+    self.input_sizes = {
+        str(stage): self._normalize_input_size(input_size, str(stage))
+        for stage, input_size in dict(input_sizes or {}).items()
+    }
+    logging.info(f'Refiner input sizes: default={self.default_input_size}, stages={self.input_sizes}')
     logging.info(f"self.cfg: \n {OmegaConf.to_yaml(self.cfg)}")
 
     self.dataset = PoseRefinePairH5Dataset(cfg=self.cfg, h5_file='', mode='test')
@@ -224,6 +232,37 @@ class PoseRefinePredictor:
     self._configure_tensorrt(tensorrt_backend, ckpt_dir)
 
 
+  @staticmethod
+  def _normalize_input_size(input_size, stage):
+    try:
+      normalized = tuple(int(value) for value in input_size)
+    except (TypeError, ValueError) as error:
+      raise ValueError(f'Refiner input size for {stage} must contain height and width, got {input_size!r}') from error
+    if len(normalized) != 2 or any(value <= 0 for value in normalized):
+      raise ValueError(f'Refiner input size for {stage} must be two positive integers, got {input_size!r}')
+    height, width = normalized
+    token_count = ((height + 7) // 8) * ((width + 7) // 8)
+    if token_count > 400:
+      raise ValueError(f'Refiner input size for {stage} produces {token_count} tokens, exceeding positional embedding limit 400')
+    return normalized
+
+
+  def _input_size_for_stage(self, network_stage):
+    return self.input_sizes.get(network_stage, self.default_input_size)
+
+
+  def _validate_tensorrt_input_size(self, runner, network_stage):
+    input_shape = runner.metadata.get('input_shape')
+    if not isinstance(input_shape, list) or len(input_shape) < 4:
+      return
+    engine_input_size = tuple(int(value) for value in input_shape[-2:])
+    expected_input_size = self._input_size_for_stage(network_stage)
+    if engine_input_size != expected_input_size:
+      raise RuntimeError(
+          f'engine input size {engine_input_size} does not match {network_stage} input size {expected_input_size}'
+      )
+
+
   def _configure_tensorrt(self, config, checkpoint_path):
     config = dict(config or {})
     enabled_override = os.getenv('FOUNDATIONPOSE_REFINER_TENSORRT')
@@ -234,30 +273,49 @@ class PoseRefinePredictor:
     configured_stages = config.get('stages', ('refiner_coarse', 'refiner_fine'))
     self.tensorrt_stages = set(configured_stages if stages_override is None else stages_override.split(','))
     self.tensorrt_stages = {stage.strip() for stage in self.tensorrt_stages if stage.strip()}
-    self.tensorrt_runner = None
-    self.tensorrt_failure_reason = None
+    self.tensorrt_runners = {}
+    self.tensorrt_failure_reasons = {}
     if not self.tensorrt_enabled:
       return
     if TensorRTEngineRunner is None:
-      self.tensorrt_failure_reason = f'TensorRT import failed: {_TENSORRT_IMPORT_ERROR}'
-      logging.warning(f'Refiner {self.tensorrt_failure_reason}; using PyTorch')
+      reason = f'TensorRT import failed: {_TENSORRT_IMPORT_ERROR}'
+      self.tensorrt_failure_reasons['all'] = reason
+      logging.warning(f'Refiner {reason}; using PyTorch')
       return
-    try:
-      self.tensorrt_runner = TensorRTEngineRunner(
-          config.get('engine_path'),
-          expected_network='refiner',
-          expected_checkpoint_path=checkpoint_path,
-      )
-      logging.info(f'Refiner TensorRT backend loaded: {self.tensorrt_runner.engine_path}')
-    except Exception as error:
-      self.tensorrt_failure_reason = f'TensorRT initialization failed: {type(error).__name__}: {error}'
-      logging.warning(f'Refiner {self.tensorrt_failure_reason}; using PyTorch')
+    legacy_engine_path = config.get('engine_path')
+    engine_paths = {
+        str(stage): engine_path
+        for stage, engine_path in dict(config.get('engine_paths', {})).items()
+    }
+    runners_by_path = {}
+    for network_stage in sorted(self.tensorrt_stages):
+      engine_path = engine_paths.get(network_stage, legacy_engine_path)
+      if not engine_path:
+        reason = f'no TensorRT engine configured for {network_stage}'
+        self.tensorrt_failure_reasons[network_stage] = reason
+        logging.warning(f'Refiner {reason}; using PyTorch for this stage')
+        continue
+      try:
+        runner = runners_by_path.get(engine_path)
+        if runner is None:
+          runner = TensorRTEngineRunner(
+              engine_path,
+              expected_network='refiner',
+              expected_checkpoint_path=checkpoint_path,
+          )
+          runners_by_path[engine_path] = runner
+        self._validate_tensorrt_input_size(runner, network_stage)
+        self.tensorrt_runners[network_stage] = runner
+        logging.info(f'Refiner {network_stage} TensorRT backend loaded: {runner.engine_path}')
+      except Exception as error:
+        reason = f'TensorRT initialization failed: {type(error).__name__}: {error}'
+        self.tensorrt_failure_reasons[network_stage] = reason
+        logging.warning(f'Refiner {network_stage} {reason}; using PyTorch for this stage')
 
 
   def _uses_tensorrt(self, candidate_count, network_stage):
     return (
-        self.tensorrt_runner is not None
-        and network_stage in self.tensorrt_stages
+        self.tensorrt_runners.get(network_stage) is not None
         and self.tensorrt_min_candidates <= candidate_count <= self.tensorrt_max_candidates
     )
 
@@ -271,6 +329,7 @@ class PoseRefinePredictor:
     }
     fallback_reason = None
     if self._uses_tensorrt(candidate_count, network_stage):
+      runner = self.tensorrt_runners[network_stage]
       try:
         dtype_start = torch.cuda.Event(enable_timing=True)
         dtype_end = torch.cuda.Event(enable_timing=True)
@@ -284,8 +343,8 @@ class PoseRefinePredictor:
         A_trt = A_trt.contiguous()
         B_trt = B_trt.contiguous()
         layout_end.record()
-        output = self.tensorrt_runner({'A': A_trt, 'B': B_trt})
-        tensorrt_events = self.tensorrt_runner.pop_last_cuda_timing_events()
+        output = runner({'A': A_trt, 'B': B_trt})
+        tensorrt_events = runner.pop_last_cuda_timing_events()
         if self.network_internal_sync_enabled:
           torch.cuda.synchronize()
           detail['dtype_convert'] = dtype_start.elapsed_time(dtype_end) / 1000.0
@@ -306,14 +365,16 @@ class PoseRefinePredictor:
         return output, 'tensorrt', None, detail
       except Exception as error:
         fallback_reason = f'TensorRT runtime failed: {type(error).__name__}: {error}'
-        self.tensorrt_failure_reason = fallback_reason
-        self.tensorrt_runner = None
-        logging.exception(f'Refiner {fallback_reason}; disabling TensorRT and using PyTorch')
+        self.tensorrt_failure_reasons[network_stage] = fallback_reason
+        self.tensorrt_runners.pop(network_stage, None)
+        logging.exception(f'Refiner {network_stage} {fallback_reason}; disabling TensorRT for this stage and using PyTorch')
     elif self.tensorrt_enabled:
       if network_stage not in self.tensorrt_stages:
         fallback_reason = f'unsupported stage {network_stage}'
       else:
-        fallback_reason = self.tensorrt_failure_reason or f'unsupported candidate count N={candidate_count}'
+        fallback_reason = self.tensorrt_failure_reasons.get(network_stage)
+        fallback_reason = fallback_reason or self.tensorrt_failure_reasons.get('all')
+        fallback_reason = fallback_reason or f'unsupported candidate count N={candidate_count}'
 
     with torch.cuda.amp.autocast(enabled=self.amp):
       output = self.model(A, B)
@@ -323,7 +384,7 @@ class PoseRefinePredictor:
 
 
   @torch.inference_mode()
-  def predict(self, rgb, depth, K, ob_in_cams, xyz_map, normal_map=None, get_vis=False, mesh=None, mesh_tensors=None, glctx=None, mesh_diameter=None, iteration=5, network_stage='refiner'):
+  def predict(self, rgb, depth, K, ob_in_cams, xyz_map, normal_map=None, get_vis=False, mesh=None, mesh_tensors=None, glctx=None, mesh_diameter=None, iteration=5, network_stage='refiner', capture_iteration_poses=False):
     '''
     @rgb: np array (H,W,3)
     @ob_in_cams: np array (N,4,4)
@@ -339,10 +400,13 @@ class PoseRefinePredictor:
       normal_map = None
 
     crop_ratio = self.cfg['crop_ratio']
+    stage_input_size = self._input_size_for_stage(network_stage)
+    logging.info(f'Refiner {network_stage} input size: {stage_input_size}')
     logging.info(f"trans_normalizer:{self.cfg['trans_normalizer']}, rot_normalizer:{self.cfg['rot_normalizer']}")
     bs = 1024
 
     B_in_cams = torch.as_tensor(ob_centered_in_cams, device='cuda', dtype=torch.float)
+    self.last_iteration_poses = []
 
 
     if mesh_tensors is None:
@@ -376,6 +440,8 @@ class PoseRefinePredictor:
         'total': 0.0,
         'other': 0.0,
         'network_internal_sync_status': 'enabled' if self.network_internal_sync_enabled else 'disabled',
+        'network_stage': network_stage,
+        'input_size': f'{stage_input_size[0]}x{stage_input_size[1]}',
         '_cuda_stage_events_enabled': self.refiner_stage1_optimizations_enabled,
     }
     network_backends = set()
@@ -385,7 +451,7 @@ class PoseRefinePredictor:
 
     for iteration_index in range(iteration):
       logging.info("making cropped data")
-      pose_data = make_crop_data_batch(self.cfg.input_resize, B_in_cams, mesh_centered, rgb_tensor, depth_tensor, K, crop_ratio=crop_ratio, normal_map=normal_map, xyz_map=xyz_map_tensor, cfg=self.cfg, glctx=glctx, mesh_tensors=mesh_tensors, dataset=self.dataset, mesh_diameter=mesh_diameter, timing=timing)
+      pose_data = make_crop_data_batch(stage_input_size, B_in_cams, mesh_centered, rgb_tensor, depth_tensor, K, crop_ratio=crop_ratio, normal_map=normal_map, xyz_map=xyz_map_tensor, cfg=self.cfg, glctx=glctx, mesh_tensors=mesh_tensors, dataset=self.dataset, mesh_diameter=mesh_diameter, timing=timing)
       B_in_cams = []
       for b in range(0, pose_data.rgbAs.shape[0], bs):
         stage_start = start_cuda_stage_timing(timing)
@@ -438,7 +504,7 @@ class PoseRefinePredictor:
           rot_delta = output["rot"]
           z_pred = output['trans'][:,2]*pose_data.poseA[b:b+bs][...,2,3]
           uvA_crop = project_and_transform_to_crop(pose_data.poseA[b:b+bs][...,:3,3])
-          uv_pred_crop = uvA_crop + output['trans'][:,:2]*self.cfg['input_resize'][0]
+          uv_pred_crop = uvA_crop + output['trans'][:,:2]*stage_input_size[1]
           if self.refiner_stage1_optimizations_enabled:
             crop_to_oris = pose_data.crop_to_oris[b:b+bs]
             Ks_inv = pose_data.Ks_inv
@@ -469,6 +535,8 @@ class PoseRefinePredictor:
         finish_cuda_stage_timing(timing, 'pose_update', stage_start)
 
       B_in_cams = torch.cat(B_in_cams, dim=0).reshape(len(ob_in_cams),4,4)
+      if capture_iteration_poses:
+        self.last_iteration_poses.append(B_in_cams.detach().cpu().numpy().astype(np.float32))
 
     B_in_cams_out = B_in_cams@torch.tensor(tf_to_center[None], device='cuda', dtype=torch.float)
     self.last_trans_update = trans_delta
@@ -519,7 +587,7 @@ class PoseRefinePredictor:
       logging.info("get_vis...")
       canvas = []
       padding = 2
-      pose_data = make_crop_data_batch(self.cfg.input_resize, torch.as_tensor(ob_centered_in_cams), mesh_centered, rgb, depth, K, crop_ratio=crop_ratio, normal_map=normal_map, xyz_map=xyz_map_tensor, cfg=self.cfg, glctx=glctx, mesh_tensors=mesh_tensors, dataset=self.dataset, mesh_diameter=mesh_diameter)
+      pose_data = make_crop_data_batch(stage_input_size, torch.as_tensor(ob_centered_in_cams), mesh_centered, rgb, depth, K, crop_ratio=crop_ratio, normal_map=normal_map, xyz_map=xyz_map_tensor, cfg=self.cfg, glctx=glctx, mesh_tensors=mesh_tensors, dataset=self.dataset, mesh_diameter=mesh_diameter)
       for id in range(0, len(B_in_cams)):
         rgbA_vis = (pose_data.rgbAs[id]*255).permute(1,2,0).data.cpu().numpy()
         rgbB_vis = (pose_data.rgbBs[id]*255).permute(1,2,0).data.cpu().numpy()
@@ -543,7 +611,7 @@ class PoseRefinePredictor:
         canvas.append(row)
       canvas = make_grid_image(canvas, nrow=1, padding=padding, pad_value=255)
 
-      pose_data = make_crop_data_batch(self.cfg.input_resize, B_in_cams, mesh_centered, rgb, depth, K, crop_ratio=crop_ratio, normal_map=normal_map, xyz_map=xyz_map_tensor, cfg=self.cfg, glctx=glctx, mesh_tensors=mesh_tensors, dataset=self.dataset, mesh_diameter=mesh_diameter)
+      pose_data = make_crop_data_batch(stage_input_size, B_in_cams, mesh_centered, rgb, depth, K, crop_ratio=crop_ratio, normal_map=normal_map, xyz_map=xyz_map_tensor, cfg=self.cfg, glctx=glctx, mesh_tensors=mesh_tensors, dataset=self.dataset, mesh_diameter=mesh_diameter)
       canvas_refined = []
       for id in range(0, len(B_in_cams)):
         rgbA_vis = (pose_data.rgbAs[id]*255).permute(1,2,0).data.cpu().numpy()

@@ -85,6 +85,10 @@ detector = YoloSegmenter(
     half=bool(yolo_cfg.get("half", True)),
     min_mask_area=int(yolo_cfg.get("min_mask_area", 100)),
     morph_kernel=int(yolo_cfg.get("morph_kernel", 5)),
+    execution_path=str(yolo_cfg.get("execution_path", "legacy")),
+    profile_stages=bool(yolo_cfg.get("profile_stages", False)),
+    fallback_to_legacy=bool(yolo_cfg.get("fallback_to_legacy", True)),
+    postprocess_backend=str(yolo_cfg.get("postprocess_backend", "gpu")),
 )
 
 frame_index = 0

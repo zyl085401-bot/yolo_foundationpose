@@ -1,14 +1,40 @@
 camera:
+  source: ros2   # realsense
   width: 640
   height: 480
   fps: 30
   serial: null
   depth_min: 0.001
   depth_max: 3.0
+  align_to_color: true
   reset_before_start: true
+
+  ros2:
+    camera_namespace: ""
+    camera_name: camera
+    color_topic: /camera/color/image_raw
+    depth_topic: /camera/aligned_depth_to_color/image_raw
+    camera_info_topic: /camera/color/camera_info
+    enable_color: true
+    enable_depth: true
+    align_depth: true
+    enable_sync: true
+    initial_reset: false
+    publish_tf: true
+    depth_scale: 0.001
+    sync_queue_size: 10
+    sync_slop_sec: 0.03
+    frame_timeout_sec: 5.0
+    bridge_cpu_cores: [0, 1, 2]
+    model_cpu_cores: [3, 4, 5, 6, 7]
+    shared_slot_count: 3
+    startup_timeout_sec: 10.0
+    reader_node_name: foundationpose_rgbd_reader
 
 yolo:
   weights: realtime_foundation/yolo_weights/best_480x640_trt104.engine
+  postprocess_backend: gpu    # gpu|cpu；cpu 仅支持 execution_path: fast。
+  
   target_class: null
   target_class_id: 0
   conf: 0.75
@@ -17,6 +43,9 @@ yolo:
   half: true
   min_mask_area: 100
   morph_kernel: 5
+  execution_path: fast  # legacy|fast；完成逐帧一致性确认后再切换生产路径。
+  profile_stages: true   # 生产关闭；基准分阶段计时时开启。
+  fallback_to_legacy: false
 
 recording:
   enabled: true
@@ -38,13 +67,13 @@ foundationpose:
   init_min_n_views: 16  # 40 30  16 在物体周围的球面上，采样多少个观察方向。
   init_inplane_step: 120 # 60 60 90每个观察方向，再绕视线方向旋转一圈，每隔多少度采样一次。
 
-  est_refine_iter: 3
+  est_refine_iter: 2
   init_strategy: topk_two_stage    # topk_two_stage
   coarse_refine_iter: 1
   coarse_score_filter: geometry
-  coarse_score_top_k: 6
-  fine_refine_iter: 2
-  fine_top_k: 6 # 决定保留几个
+  coarse_score_top_k: 5
+  fine_refine_iter: 1
+  fine_top_k: 5 # 决定保留几个
   # 当Coarse Scorer不会删除任何候选时跳过该阶段；仅改变候选顺序，人工A/B确认前保持关闭。
   skip_redundant_coarse_scorer: true
 
@@ -53,7 +82,7 @@ foundationpose:
   axis_prior_model_axis: [0.0, 1.0, 0.0]
   axis_prior_max_angle_deg: 60
   axis_prior_min_candidates: 5
-  axis_prior_max_candidates: 12
+  axis_prior_max_candidates: 8
   axis_prior_min_points: 500
   axis_prior_min_confidence: 1.0
 
@@ -72,6 +101,32 @@ foundationpose:
   # 注册质量门已生成最终Pose的Render Mask；轮廓显示/记录直接复用，避免相同Pose再次渲染。
   quality_render_mask_reuse_enabled: true
 
+  # 网络渲染LOD总开关。关闭时所有阶段继续使用原Mesh；开启失败时自动回退原Mesh。
+  # 原Mesh始终用于中心/直径/点云/BBox/Pose坐标系、注册质量门和最终轮廓显示。
+  render_lod:
+    enabled: false
+    mesh_file: FoundationPose/demo_data/cup0708/mesh/textured_simple_lod1.obj
+    stages:
+      refiner_coarse: true
+      scorer_coarse: true
+      refiner_fine: true
+      scorer_fine: true
+      refiner_track: false
+      refiner_default: true
+      scorer_default: true
+    validation:
+      require_texture: true
+      min_texture_size: 16
+      max_face_ratio: 0.75
+      max_center_delta_ratio: 0.01
+      max_extent_delta_ratio: 0.03
+    # 使用成功初始化时的真实RGB、K和最终Pose生成2x2对比图；调用位于init_total计时结束之后。
+    comparison:
+      enabled: true
+      output_dir: realtime_foundation/outputs/render_lod_comparison
+      max_records: 5
+      jpeg_quality: 95
+
   # 仅用于拆分nvdiffrast渲染内部耗时；会增加CUDA Event和同步开销，正常运行保持关闭。
   render_profile_enabled: false
 
@@ -89,13 +144,22 @@ foundationpose:
   scorer_shared_warp_grid_enabled: true
   scorer_skip_unused_depth_warp_enabled: true
 
-  # Scorer TensorRT已通过300次真实帧回放；Refiner FP16会放大候选分支敏感性，保持PyTorch。
+  # Phase 1：仅Coarse Refiner降低到128；Fine、Track及全部Scorer继续使用训练分辨率160。
+  refiner_input_sizes:
+    refiner_coarse: [128, 128]
+    refiner_fine: [128, 128]
+    refiner_track: [160, 160]
+
+  # Scorer TensorRT已通过300次真实帧回放；Refiner按阶段加载固定空间尺寸引擎并独立回退。
   # 可用FOUNDATIONPOSE_REFINER_TENSORRT和FOUNDATIONPOSE_SCORER_TENSORRT单独覆盖。
-  # 任何加载、shape或执行异常都会自动回退PyTorch。
+  # Coarse 128引擎尚未生成时只有该阶段自动回退PyTorch，不影响Fine 160 TensorRT。
+  # refiner_n5_12_128x128_fp16_trt104.engine
   tensorrt:
     refiner:
       enabled: true
-      engine_path: realtime_foundation/outputs/tensorrt_probe/refiner_n5_12_fp16_trt104.engine
+      engine_paths:
+        refiner_coarse: realtime_foundation/engine/refiner_n5_12_128x128_fp16_trt104.engine
+        refiner_fine: realtime_foundation/engine/refiner_n5_12_128x128_fp16_trt104.engine
       min_candidates: 5
       max_candidates: 12
       stages: [refiner_coarse, refiner_fine]  # refiner_track固定使用PyTorch。
@@ -103,8 +167,8 @@ foundationpose:
       enabled: true
       # Scorer候选维参与Cross Attention，不能padding；N=5和N=6使用独立固定shape引擎。
       engine_paths:
-        5: realtime_foundation/outputs/tensorrt_probe/scorer_n5_fp16_attn_fp32_trt104.engine
-        6: realtime_foundation/outputs/tensorrt_probe/scorer_n6_fp16_attn_fp32_trt104.engine
+        5: realtime_foundation/engine/scorer_n5_fp16_attn_fp32_trt104.engine
+        6: realtime_foundation/engine/scorer_n6_fp16_attn_fp32_trt104.engine
 
   # 轴先验候选诊断：开启后保存过滤前、截断边界和最终保留候选的联系图。
   # 仅用于初始化调参，会增加额外渲染和图片写入耗时；不会在 tracking 阶段执行。
@@ -149,4 +213,10 @@ runtime:
   show_window: true
   pose_output: realtime_foundation/outputs/latest_pose.txt
   loop_sleep: 0.0
+
+# 单帧 NPZ 回放候选流水线诊断。仅由 simulate_recorded_camera.py 读取；
+# 开启后保存各阶段联系图、固定候选 ID、Pose/更新量、筛选指标、JSON 和 NPZ。
+# 会增加 GPU 渲染、CPU 同步和磁盘写入耗时，实时生产路径不会读取此开关。
+simulation:
+  candidate_pipeline_debug_enabled: false
 

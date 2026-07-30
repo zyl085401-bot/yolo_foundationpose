@@ -35,6 +35,15 @@ import learning.training.predict_score as score_module  # noqa: E402
 
 
 _ORIGINAL_COMPUTE_CROP_WINDOW_TF_BATCH = pose_refine_module.compute_crop_window_tf_batch
+_RENDER_LOD_STAGE_NAMES = {
+  "refiner_coarse",
+  "scorer_coarse",
+  "refiner_fine",
+  "scorer_fine",
+  "refiner_track",
+  "refiner_default",
+  "scorer_default",
+}
 
 
 def _compute_crop_window_tf_batch_float32(*, pts, H, W, poses, K, crop_ratio, out_size, method, mesh_diameter=None):
@@ -158,6 +167,7 @@ class FoundationPoseRealtimeTracker:
       scorer_shared_warp_grid_enabled: bool = False,
       scorer_skip_unused_depth_warp_enabled: bool = False,
       tensorrt_backends: dict | None = None,
+      refiner_input_sizes: dict | None = None,
       track_refine_iter: int = 2,
       vis_mode: str = "box",
       contour_thickness: int = 3,
@@ -166,6 +176,8 @@ class FoundationPoseRealtimeTracker:
       network_internal_sync_enabled: bool = True,
       frame_statistics_reuse_enabled: bool = False,
       quality_render_mask_reuse_enabled: bool = False,
+      render_lod: dict | None = None,
+      candidate_pipeline_debug_enabled: bool = False,
   ):
     set_logging_format()
     set_seed(0)
@@ -186,6 +198,7 @@ class FoundationPoseRealtimeTracker:
     self.skip_redundant_coarse_scorer = skip_redundant_coarse_scorer
     self.frame_statistics_reuse_enabled = frame_statistics_reuse_enabled
     self.quality_render_mask_reuse_enabled = quality_render_mask_reuse_enabled
+    self.candidate_pipeline_debug_enabled = candidate_pipeline_debug_enabled
     self.axis_prior_filter = axis_prior_filter
     self.axis_prior_model_axis = axis_prior_model_axis
     self.axis_prior_max_angle_deg = axis_prior_max_angle_deg
@@ -206,6 +219,19 @@ class FoundationPoseRealtimeTracker:
     self.axis_scale = axis_scale
     self.initialized = False
     self.last_pose = None
+    self.render_lod_config = dict(render_lod or {})
+    self.render_lod_requested = bool(self.render_lod_config.get("enabled", False))
+    self.render_lod_enabled = False
+    self.render_lod_mesh = None
+    self.render_lod_status = "disabled"
+    self.render_lod_fallback_reason = None
+    comparison_config = dict(self.render_lod_config.get("comparison", {}) or {})
+    self.render_lod_comparison_enabled = bool(comparison_config.get("enabled", False))
+    self.render_lod_comparison_dir = comparison_config.get("output_dir") or os.path.join(debug_dir, "render_lod_comparison")
+    self.render_lod_comparison_max_records = max(0, int(comparison_config.get("max_records", 5)))
+    self.render_lod_comparison_jpeg_quality = max(1, min(int(comparison_config.get("jpeg_quality", 95)), 100))
+    self._render_lod_comparison_run_id = time.strftime("run_%Y%m%d_%H%M%S")
+    self._render_lod_comparison_count = 0
 
     _set_crop_window_patch(self.use_float32_crop_window_patch)
 
@@ -232,6 +258,7 @@ class FoundationPoseRealtimeTracker:
     self.refiner = PoseRefinePredictor(
       network_input_capture=network_input_capture,
       tensorrt_backend=tensorrt_backends.get("refiner"),
+      input_sizes=refiner_input_sizes,
       render_profile_enabled=render_profile_enabled,
       render_batched_matmul_enabled=render_batched_matmul_enabled,
       refiner_stage1_optimizations_enabled=refiner_stage1_optimizations_enabled,
@@ -251,7 +278,246 @@ class FoundationPoseRealtimeTracker:
         init_min_n_views=self.init_min_n_views,
         init_inplane_step=self.init_inplane_step,
     )
+    self._configure_render_lod()
     self._ensure_estimator_float32()
+
+  def _configure_render_lod(self) -> None:
+    if not self.render_lod_requested:
+      return
+    try:
+      mesh_file = self.render_lod_config.get("mesh_file")
+      if not isinstance(mesh_file, str) or not mesh_file:
+        raise ValueError("foundationpose.render_lod.mesh_file must be configured")
+      if not os.path.isfile(mesh_file):
+        raise FileNotFoundError(f"LOD mesh does not exist: {mesh_file}")
+
+      stage_config = self.render_lod_config.get("stages", {}) or {}
+      if not isinstance(stage_config, dict):
+        raise ValueError("foundationpose.render_lod.stages must be a mapping")
+      unknown_stages = set(stage_config) - _RENDER_LOD_STAGE_NAMES
+      if unknown_stages:
+        raise ValueError(f"Unknown LOD render stages: {sorted(unknown_stages)}")
+      enabled_stages = {stage for stage, enabled in stage_config.items() if bool(enabled)}
+      if not enabled_stages:
+        raise ValueError("No LOD render stages are enabled")
+
+      loaded = trimesh.load(mesh_file, force="mesh", process=False)
+      if not isinstance(loaded, trimesh.Trimesh):
+        raise TypeError(f"LOD file must contain one triangle mesh, got {type(loaded).__name__}")
+      lod_mesh = loaded.copy()
+      lod_mesh.vertices = np.asarray(lod_mesh.vertices, dtype=np.float32)
+      self._validate_render_lod_mesh(lod_mesh)
+      lod_mesh.vertices = np.ascontiguousarray(
+          lod_mesh.vertices - np.asarray(self.estimator.model_center, dtype=np.float32).reshape(1, 3),
+          dtype=np.float32,
+      )
+      self.estimator.configure_render_lod(lod_mesh, enabled_stages)
+      self.render_lod_mesh = lod_mesh
+      self.render_lod_enabled = True
+      self.render_lod_status = "enabled"
+      original_faces = int(len(self.estimator.mesh.faces))
+      lod_faces = int(len(lod_mesh.faces))
+      print(
+          f"[RenderLOD] enabled: original={original_faces} triangles, LOD={lod_faces} triangles, "
+          f"stages={sorted(enabled_stages)}"
+      )
+    except Exception as exc:
+      self.estimator.clear_render_lod()
+      self.render_lod_enabled = False
+      self.render_lod_mesh = None
+      self.render_lod_status = "fallback_original"
+      self.render_lod_fallback_reason = str(exc)
+      logging.warning("Render LOD disabled; falling back to the original mesh: %s", exc)
+
+  def _validate_render_lod_mesh(self, lod_mesh: trimesh.Trimesh) -> None:
+    validation = dict(self.render_lod_config.get("validation", {}) or {})
+    vertices = np.asarray(lod_mesh.vertices)
+    faces = np.asarray(lod_mesh.faces)
+    if vertices.ndim != 2 or vertices.shape[1] != 3 or len(vertices) < 3:
+      raise ValueError(f"LOD vertices have invalid shape: {vertices.shape}")
+    if faces.ndim != 2 or faces.shape[1] != 3 or len(faces) < 1:
+      raise ValueError(f"LOD faces have invalid shape: {faces.shape}")
+    if not np.isfinite(vertices).all():
+      raise ValueError("LOD vertices contain NaN or infinity")
+    if faces.min() < 0 or faces.max() >= len(vertices):
+      raise ValueError("LOD face indices are outside the vertex array")
+
+    original_faces = max(1, int(len(self.mesh.faces)))
+    face_ratio = len(faces) / original_faces
+    max_face_ratio = float(validation.get("max_face_ratio", 0.75))
+    if face_ratio > max_face_ratio:
+      raise ValueError(
+          f"LOD triangle ratio {face_ratio:.3f} exceeds max_face_ratio={max_face_ratio:.3f}"
+      )
+
+    original_bounds = np.asarray(self.mesh.bounds, dtype=np.float64)
+    lod_bounds = np.asarray(lod_mesh.bounds, dtype=np.float64)
+    original_extent = original_bounds[1] - original_bounds[0]
+    lod_extent = lod_bounds[1] - lod_bounds[0]
+    original_diagonal = max(float(np.linalg.norm(original_extent)), 1e-9)
+    center_delta_ratio = float(np.linalg.norm(lod_bounds.mean(axis=0) - original_bounds.mean(axis=0)) / original_diagonal)
+    extent_delta_ratio = float(np.max(np.abs(lod_extent - original_extent)) / original_diagonal)
+    max_center_delta_ratio = float(validation.get("max_center_delta_ratio", 0.01))
+    max_extent_delta_ratio = float(validation.get("max_extent_delta_ratio", 0.03))
+    if center_delta_ratio > max_center_delta_ratio:
+      raise ValueError(
+          f"LOD center delta ratio {center_delta_ratio:.6f} exceeds {max_center_delta_ratio:.6f}"
+      )
+    if extent_delta_ratio > max_extent_delta_ratio:
+      raise ValueError(
+          f"LOD extent delta ratio {extent_delta_ratio:.6f} exceeds {max_extent_delta_ratio:.6f}"
+      )
+
+    if bool(validation.get("require_texture", True)):
+      if not isinstance(lod_mesh.visual, trimesh.visual.texture.TextureVisuals):
+        raise ValueError("LOD mesh does not contain texture visuals")
+      uv = np.asarray(lod_mesh.visual.uv)
+      if uv.shape != (len(vertices), 2) or not np.isfinite(uv).all():
+        raise ValueError(f"LOD UV array has invalid shape or values: {uv.shape}")
+      image = getattr(lod_mesh.visual.material, "image", None)
+      if image is None:
+        raise ValueError("LOD material does not contain a texture image")
+      image_array = np.asarray(image)
+      min_texture_size = int(validation.get("min_texture_size", 16))
+      if image_array.ndim < 2 or min(image_array.shape[:2]) < min_texture_size:
+        raise ValueError(
+            f"LOD texture is only {image_array.shape[:2]}; expected at least "
+            f"{min_texture_size}x{min_texture_size}"
+        )
+
+  def save_render_lod_comparison(
+      self,
+      color: np.ndarray,
+      K: np.ndarray,
+      frame_id: int | None = None,
+      centered_pose: np.ndarray | None = None,
+  ) -> str | None:
+    if not self.render_lod_enabled or not self.render_lod_comparison_enabled:
+      return None
+    if self._render_lod_comparison_count >= self.render_lod_comparison_max_records:
+      return None
+    if centered_pose is None:
+      centered_pose = self.estimator.pose_last
+    if centered_pose is None:
+      return None
+
+    color = np.ascontiguousarray(color, dtype=np.uint8)
+    K = np.ascontiguousarray(K, dtype=np.float32)
+    if torch.is_tensor(centered_pose):
+      centered_pose = centered_pose.detach().cpu().numpy()
+    centered_pose = np.ascontiguousarray(centered_pose, dtype=np.float32).reshape(4, 4)
+    pose_tensor = torch.as_tensor(centered_pose, device="cuda", dtype=torch.float32).reshape(1, 4, 4)
+    original_mask, original_depth = nvdiffrast_render_mask(
+        K=K,
+        H=color.shape[0],
+        W=color.shape[1],
+        ob_in_cams=pose_tensor,
+        glctx=self.glctx,
+        mesh_tensors=self.estimator.mesh_tensors,
+        return_depth=True,
+    )
+    lod_mask, lod_depth = nvdiffrast_render_mask(
+        K=K,
+        H=color.shape[0],
+        W=color.shape[1],
+        ob_in_cams=pose_tensor,
+        glctx=self.glctx,
+        mesh_tensors=self.estimator.render_lod_mesh_tensors,
+        return_depth=True,
+    )
+    original_mask = original_mask[0].astype(bool)
+    lod_mask = lod_mask[0].astype(bool)
+    original_depth = original_depth[0]
+    lod_depth = lod_depth[0]
+    overlap = original_mask & lod_mask
+    union = original_mask | lod_mask
+    original_only = original_mask & ~lod_mask
+    lod_only = lod_mask & ~original_mask
+    depth_difference_mm = np.zeros_like(original_depth, dtype=np.float32)
+    depth_difference_mm[overlap] = np.abs(original_depth[overlap] - lod_depth[overlap]) * 1000.0
+    overlap_depth_difference = depth_difference_mm[overlap]
+    metrics = {
+        "original_triangles": int(len(self.estimator.mesh.faces)),
+        "lod_triangles": int(len(self.render_lod_mesh.faces)),
+        "mask_iou": float(overlap.sum() / union.sum()) if union.any() else 1.0,
+        "original_mask_pixels": int(original_mask.sum()),
+        "lod_mask_pixels": int(lod_mask.sum()),
+        "original_only_pixels": int(original_only.sum()),
+        "lod_only_pixels": int(lod_only.sum()),
+        "mean_depth_difference_mm": float(overlap_depth_difference.mean()) if overlap_depth_difference.size else None,
+        "p95_depth_difference_mm": float(np.percentile(overlap_depth_difference, 95)) if overlap_depth_difference.size else None,
+        "max_depth_difference_mm": float(overlap_depth_difference.max()) if overlap_depth_difference.size else None,
+    }
+
+    def draw_contour(mask: np.ndarray, color_value: tuple[int, int, int], title: str) -> np.ndarray:
+      panel = color.copy()
+      contours, _ = cv2.findContours(mask.astype(np.uint8) * 255, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+      if contours:
+        cv2.drawContours(panel, contours, -1, color_value, self.contour_thickness, cv2.LINE_AA)
+      return self._label_render_lod_panel(panel, title)
+
+    original_panel = draw_contour(original_mask, (0, 255, 255), "Original mesh contour")
+    lod_panel = draw_contour(lod_mask, (255, 255, 0), "LOD mesh contour")
+    difference_panel = (color.astype(np.float32) * 0.35).astype(np.uint8)
+    difference_panel[overlap] = (0, 190, 0)
+    difference_panel[original_only] = (255, 0, 0)
+    difference_panel[lod_only] = (0, 0, 255)
+    difference_panel = self._label_render_lod_panel(
+        difference_panel,
+        f"Mask overlap: green | original-only: red | LOD-only: blue | IoU={metrics['mask_iou']:.4f}",
+    )
+    display_max_mm = max(1.0, float(np.percentile(overlap_depth_difference, 99)) if overlap_depth_difference.size else 1.0)
+    normalized_depth = np.clip(depth_difference_mm / display_max_mm * 255.0, 0.0, 255.0).astype(np.uint8)
+    depth_panel = cv2.applyColorMap(normalized_depth, cv2.COLORMAP_TURBO)[..., ::-1]
+    depth_panel[~overlap] = (0, 0, 0)
+    depth_panel = self._label_render_lod_panel(
+        depth_panel,
+        f"Depth |original-LOD| (0-{display_max_mm:.2f} mm)",
+    )
+    comparison = np.concatenate(
+        (
+            np.concatenate((original_panel, lod_panel), axis=1),
+            np.concatenate((difference_panel, depth_panel), axis=1),
+        ),
+        axis=0,
+    )
+
+    record_index = self._render_lod_comparison_count + 1
+    frame_suffix = "unknown" if frame_id is None else f"{int(frame_id):06d}"
+    record_dir = os.path.join(
+        self.render_lod_comparison_dir,
+        self._render_lod_comparison_run_id,
+        f"register_{record_index:04d}_frame_{frame_suffix}",
+    )
+    os.makedirs(record_dir, exist_ok=True)
+    comparison_path = os.path.join(record_dir, "comparison.jpg")
+    if not cv2.imwrite(
+        comparison_path,
+        np.ascontiguousarray(comparison[..., ::-1]),
+        [cv2.IMWRITE_JPEG_QUALITY, self.render_lod_comparison_jpeg_quality],
+    ):
+      raise RuntimeError(f"cv2.imwrite failed: {comparison_path}")
+    np.savez_compressed(
+        os.path.join(record_dir, "render_data.npz"),
+        K=K,
+        centered_pose=centered_pose,
+        original_mask=original_mask.astype(np.uint8),
+        lod_mask=lod_mask.astype(np.uint8),
+        original_depth=original_depth.astype(np.float32),
+        lod_depth=lod_depth.astype(np.float32),
+    )
+    with open(os.path.join(record_dir, "summary.json"), "w", encoding="utf-8") as file:
+      json.dump(metrics, file, indent=2, ensure_ascii=False)
+    self._render_lod_comparison_count = record_index
+    print(f"[RenderLOD] Saved runtime comparison: {comparison_path}")
+    return comparison_path
+
+  @staticmethod
+  def _label_render_lod_panel(image: np.ndarray, text: str) -> np.ndarray:
+    output = np.ascontiguousarray(image, dtype=np.uint8)
+    cv2.putText(output, text, (12, 28), cv2.FONT_HERSHEY_SIMPLEX, 0.58, (0, 0, 0), 4, cv2.LINE_AA)
+    cv2.putText(output, text, (12, 28), cv2.FONT_HERSHEY_SIMPLEX, 0.58, (255, 255, 255), 1, cv2.LINE_AA)
+    return output
 
   def reset(self) -> None:
     self.initialized = False
@@ -283,6 +549,7 @@ class FoundationPoseRealtimeTracker:
         axis_prior_min_confidence=self.axis_prior_min_confidence,
         axis_prior_debug=self.axis_prior_visualization_enabled,
         frame_statistics_reuse_enabled=self.frame_statistics_reuse_enabled,
+        candidate_pipeline_debug_enabled=self.candidate_pipeline_debug_enabled,
     )
     if self.axis_prior_visualization_enabled:
       try:
@@ -592,3 +859,7 @@ class FoundationPoseRealtimeTracker:
     for key, value in self.estimator.mesh_tensors.items():
       if torch.is_tensor(value) and value.is_floating_point():
         self.estimator.mesh_tensors[key] = value.float().contiguous()
+    if self.estimator.render_lod_mesh_tensors is not None:
+      for key, value in self.estimator.render_lod_mesh_tensors.items():
+        if torch.is_tensor(value) and value.is_floating_point():
+          self.estimator.render_lod_mesh_tensors[key] = value.float().contiguous()

@@ -1,5 +1,6 @@
 image: ./rgb/006.png
 weights: ../yolo_weights/best.pt
+postprocess_backend: gpu
 target_class: null
 target_class_id: 0
 conf: 0.35
@@ -8,4 +9,7 @@ device: cuda:0
 half: true
 min_mask_area: 100
 morph_kernel: 5
+execution_path: legacy
+profile_stages: false
+fallback_to_legacy: true
 output_dir: ../outputs/yolo_segment_test

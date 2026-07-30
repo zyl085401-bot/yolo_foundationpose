@@ -299,7 +299,7 @@ def nvdiffrast_render(K=None, H=None, W=None, ob_in_cams=None, glctx=None, conte
   return color, depth, normal_map
 
 
-def nvdiffrast_render_mask(K, H, W, ob_in_cams, glctx=None, mesh_tensors=None, mesh=None, depth_min=0.001):
+def nvdiffrast_render_mask(K, H, W, ob_in_cams, glctx=None, mesh_tensors=None, mesh=None, depth_min=0.001, return_depth=False):
   """Render the same NumPy depth mask as nvdiffrast_render without unused RGB work."""
   if glctx is None:
     glctx = dr.RasterizeCudaContext()
@@ -321,7 +321,11 @@ def nvdiffrast_render_mask(K, H, W, ob_in_cams, glctx=None, mesh_tensors=None, m
   rast_out, _ = dr.rasterize(glctx, pos_clip, pos_idx, resolution=np.asarray([H,W]))
   xyz_map, _ = dr.interpolate(pts_cam, rast_out, pos_idx)
   depth = torch.flip(xyz_map[...,2], dims=[1])
-  return (depth.detach().cpu().numpy()>depth_min).astype(np.uint8)
+  depth_numpy = depth.detach().cpu().numpy()
+  mask = (depth_numpy>depth_min).astype(np.uint8)
+  if return_depth:
+    return mask, depth_numpy
+  return mask
 
 
 def finalize_nvdiffrast_render_timing(render_timing):

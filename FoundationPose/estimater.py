@@ -509,13 +509,15 @@ class FoundationPose:
     return poses_filtered, filter_info
 
 
-  def register(self, K, rgb, depth, ob_mask, ob_id=None, glctx=None, iteration=5, init_strategy='default', coarse_refine_iter=1, coarse_score_filter='none', coarse_score_top_k=999999, fine_refine_iter=2, fine_top_k=16, axis_prior_filter='none', axis_prior_model_axis=(0,0,1), axis_prior_max_angle_deg=45, axis_prior_min_candidates=12, axis_prior_max_candidates=0, axis_prior_min_points=500, axis_prior_min_confidence=1.4, axis_prior_debug=False, skip_redundant_coarse_scorer=False, frame_statistics_reuse_enabled=False, candidate_pipeline_debug_enabled=False):
+  def register(self, K, rgb, depth, ob_mask, ob_id=None, glctx=None, iteration=5, init_strategy='default', coarse_refine_iter=1, coarse_score_filter='none', coarse_score_top_k=999999, fine_refine_iter=2, fine_top_k=16, axis_prior_filter='none', axis_prior_model_axis=(0,0,1), axis_prior_max_angle_deg=45, axis_prior_min_candidates=12, axis_prior_max_candidates=0, axis_prior_min_points=500, axis_prior_min_confidence=1.4, axis_prior_debug=False, skip_redundant_coarse_scorer=False, frame_statistics_reuse_enabled=False, candidate_pipeline_debug_enabled=False, distillation_capture_enabled=False):
     '''Copmute pose from given pts to self.pcd
     @pts: (N,3) np array, downsampled scene points
     '''
     timing = {}
     self.last_axis_prior_diagnostics = None
     self.last_candidate_diagnostics = None
+    self.last_distillation_group = None
+    candidate_identity_enabled = bool(candidate_pipeline_debug_enabled or distillation_capture_enabled)
     candidate_diagnostics = None
     if candidate_pipeline_debug_enabled:
       candidate_diagnostics = {
@@ -648,9 +650,9 @@ class FoundationPose:
           min_candidates=axis_prior_min_candidates,
           max_candidates=axis_prior_max_candidates,
           collect_diagnostics=axis_prior_debug,
-          return_candidate_metrics=candidate_pipeline_debug_enabled,
+          return_candidate_metrics=candidate_identity_enabled,
       )
-      if candidate_pipeline_debug_enabled:
+      if candidate_identity_enabled:
         poses, filter_info, axis_candidate_metrics = filter_result
         if axis_candidate_metrics is not None:
           kept_positions = np.asarray(axis_candidate_metrics['kept_indices'], dtype=np.int64)
@@ -660,17 +662,18 @@ class FoundationPose:
         else:
           selected_candidate_ids = candidate_ids.copy()
           axis_rank = None
-        capture_candidate_stage(
-            'initial_hypotheses',
-            initial_poses,
-            candidate_ids,
-            selected_candidate_ids=selected_candidate_ids,
-            axis_alignment=None if axis_candidate_metrics is None else axis_candidate_metrics['alignment'],
-            axis_angle_deg=None if axis_candidate_metrics is None else axis_candidate_metrics['angles_deg'],
-            axis_rank=axis_rank,
-            axis_ranked_positions=None if axis_candidate_metrics is None else axis_candidate_metrics['ranked_indices'],
-            axis_angle_pass=None if axis_candidate_metrics is None else axis_candidate_metrics['angle_pass_mask'],
-        )
+        if candidate_pipeline_debug_enabled:
+          capture_candidate_stage(
+              'initial_hypotheses',
+              initial_poses,
+              candidate_ids,
+              selected_candidate_ids=selected_candidate_ids,
+              axis_alignment=None if axis_candidate_metrics is None else axis_candidate_metrics['alignment'],
+              axis_angle_deg=None if axis_candidate_metrics is None else axis_candidate_metrics['angles_deg'],
+              axis_rank=axis_rank,
+              axis_ranked_positions=None if axis_candidate_metrics is None else axis_candidate_metrics['ranked_indices'],
+              axis_angle_pass=None if axis_candidate_metrics is None else axis_candidate_metrics['angle_pass_mask'],
+          )
         candidate_ids = selected_candidate_ids
       else:
         poses, filter_info = filter_result
@@ -761,26 +764,27 @@ class FoundationPose:
       else:
         score_ids = torch.linspace(0, len(poses) - 1, steps=score_k, device=poses.device).long()
       score_poses = poses[score_ids]
-      if candidate_pipeline_debug_enabled:
+      if candidate_identity_enabled:
         score_positions = score_ids.detach().cpu().numpy().astype(np.int64)
         score_candidate_ids = candidate_ids[score_positions]
         geometry_metrics = {}
-        if geometry_components is not None:
+        if candidate_pipeline_debug_enabled and geometry_components is not None:
           for key, value in geometry_components.items():
             geometry_metrics[f'geometry_{key}'] = value.detach().cpu().numpy().astype(np.float32)
           geometry_order = geometry_metrics['geometry_total_score'].argsort()
           geometry_rank = np.empty(len(geometry_order), dtype=np.int64)
           geometry_rank[geometry_order] = np.arange(1, len(geometry_order) + 1, dtype=np.int64)
           geometry_metrics['geometry_rank'] = geometry_rank
-        capture_candidate_stage(
-            'geometry_filter',
-            poses,
-            candidate_ids,
-            parent_stage=coarse_parent_stage,
-            selected_candidate_ids=score_candidate_ids,
-            filter_mode=str(coarse_score_filter),
-            **geometry_metrics,
-        )
+        if candidate_pipeline_debug_enabled:
+          capture_candidate_stage(
+              'geometry_filter',
+              poses,
+              candidate_ids,
+              parent_stage=coarse_parent_stage,
+              selected_candidate_ids=score_candidate_ids,
+              filter_mode=str(coarse_score_filter),
+              **geometry_metrics,
+          )
       if self.last_axis_prior_diagnostics is not None:
         self.last_axis_prior_diagnostics['coarse_selected_positions'] = score_ids.detach().cpu().numpy().astype(np.int64)
       torch.cuda.synchronize()
@@ -822,18 +826,19 @@ class FoundationPose:
       t0 = time.perf_counter()
       if coarse_scorer_redundant:
         poses = score_poses
-        if candidate_pipeline_debug_enabled:
+        if candidate_identity_enabled:
           selected_candidate_ids = score_candidate_ids.copy()
           coarse_rank = None
       else:
         top_ids = torch.as_tensor(scores).argsort(descending=True)[:top_k]
         poses = score_poses[top_ids]
-        if candidate_pipeline_debug_enabled:
+        if candidate_identity_enabled:
           top_positions = top_ids.detach().cpu().numpy().astype(np.int64)
           selected_candidate_ids = score_candidate_ids[top_positions]
-          coarse_order = coarse_scores_numpy.argsort()[::-1]
-          coarse_rank = np.empty(len(coarse_order), dtype=np.int64)
-          coarse_rank[coarse_order] = np.arange(1, len(coarse_order) + 1, dtype=np.int64)
+          if candidate_pipeline_debug_enabled:
+            coarse_order = coarse_scores_numpy.argsort()[::-1]
+            coarse_rank = np.empty(len(coarse_order), dtype=np.int64)
+            coarse_rank[coarse_order] = np.arange(1, len(coarse_order) + 1, dtype=np.int64)
       if candidate_pipeline_debug_enabled:
         capture_candidate_stage(
             'coarse_scorer',
@@ -845,6 +850,7 @@ class FoundationPose:
             scorer_score=coarse_scores_numpy,
             scorer_rank=coarse_rank,
         )
+      if candidate_identity_enabled:
         candidate_ids = selected_candidate_ids
       torch.cuda.synchronize()
       timing['topk_select'] = time.perf_counter() - t0
@@ -852,7 +858,7 @@ class FoundationPose:
       timing['refiner_fine_candidates'] = int(len(poses))
       t0 = time.perf_counter()
       refiner_pose_input = poses if refiner_stage1_enabled else poses.data.cpu().numpy()
-      poses, vis = self.refiner.predict(mesh=self.mesh, mesh_tensors=self.get_render_mesh_tensors('refiner_fine'), rgb=rgb_cuda, depth=depth_cuda, K=K, ob_in_cams=refiner_pose_input, normal_map=normal_map, xyz_map=xyz_map_cuda, glctx=self.glctx, mesh_diameter=self.diameter, iteration=fine_refine_iter, get_vis=self.debug>=2, network_stage='refiner_fine', capture_iteration_poses=candidate_pipeline_debug_enabled)
+      poses, vis = self.refiner.predict(mesh=self.mesh, mesh_tensors=self.get_render_mesh_tensors('refiner_fine'), rgb=rgb_cuda, depth=depth_cuda, K=K, ob_in_cams=refiner_pose_input, normal_map=normal_map, xyz_map=xyz_map_cuda, glctx=self.glctx, mesh_diameter=self.diameter, iteration=fine_refine_iter, get_vis=self.debug>=2, network_stage='refiner_fine', capture_iteration_poses=candidate_pipeline_debug_enabled, capture_distillation_data=distillation_capture_enabled)
       torch.cuda.synchronize()
       fine_parent_stage = 'coarse_scorer'
       if candidate_pipeline_debug_enabled:
@@ -879,6 +885,39 @@ class FoundationPose:
       scorer_pose_input = poses if refiner_stage1_enabled else poses.data.cpu().numpy()
       scores, vis = self.scorer.predict(mesh=self.mesh, rgb=rgb_cuda, depth=depth_cuda, K=K, ob_in_cams=scorer_pose_input, normal_map=normal_map, xyz_map=xyz_map_for_scorer, mesh_tensors=self.get_render_mesh_tensors('scorer_fine'), glctx=self.glctx, mesh_diameter=self.diameter, get_vis=self.debug>=2, network_stage='scorer_fine')
       torch.cuda.synchronize()
+      if distillation_capture_enabled:
+        raw_teacher_logits = np.asarray(self.scorer.last_raw_score_logits, dtype=np.float32).reshape(-1)
+        public_teacher_scores = np.asarray(scores.detach().cpu().numpy() if torch.is_tensor(scores) else scores, dtype=np.float32).reshape(-1)
+        refiner_capture = getattr(self.refiner, 'last_distillation_data', None)
+        if refiner_capture is None:
+          raise RuntimeError('Fine Refiner did not produce distillation capture data')
+        if len(candidate_ids) != len(raw_teacher_logits):
+          raise RuntimeError(
+              f'Distillation candidate/logit mismatch: candidates={len(candidate_ids)}, logits={len(raw_teacher_logits)}'
+          )
+        if not np.isfinite(raw_teacher_logits).all():
+          raise RuntimeError('Final Scorer raw logits are incomplete or non-finite')
+        teacher_order_positions = raw_teacher_logits.argsort()[::-1].astype(np.int64)
+        teacher_margin = (
+            float(raw_teacher_logits[teacher_order_positions[0]] - raw_teacher_logits[teacher_order_positions[1]])
+            if len(teacher_order_positions) > 1 else float('inf')
+        )
+        candidate_ids_array = np.asarray(candidate_ids, dtype=np.int64)
+        self.last_distillation_group = {
+            'schema_version': 1,
+            'feature_version': str(refiner_capture['feature_version']),
+            'candidate_ids': candidate_ids_array,
+            'candidate_count': int(len(candidate_ids_array)),
+            'fine_iterations': refiner_capture['iterations'],
+            'teacher_raw_logits': raw_teacher_logits,
+            'teacher_public_scores': public_teacher_scores,
+            'teacher_order_positions': teacher_order_positions,
+            'teacher_order_candidate_ids': candidate_ids_array[teacher_order_positions],
+            'teacher_top1_candidate_id': int(candidate_ids_array[teacher_order_positions[0]]),
+            'teacher_margin': teacher_margin,
+            'teacher_backend': str(getattr(self.scorer, 'last_score_backend', None)),
+            'final_poses': poses.detach().cpu().numpy().astype(np.float32),
+        }
       if candidate_pipeline_debug_enabled:
         final_scores_numpy = np.asarray(scores.detach().cpu().numpy() if torch.is_tensor(scores) else scores, dtype=np.float32).reshape(-1)
         final_order = final_scores_numpy.argsort()[::-1]

@@ -48,3 +48,8 @@ FULL_INTERVAL_MS=200 FAST_INTERVAL_MS=50 \
 #   init_total                       YOLO 开始到初始化质量检查通过的端到端时间
 
   nvidia
+# 减小mesh模型的大小
+  python3 FoundationPose/tools/generate_textured_lod.py \
+  FoundationPose/demo_data/cup0708/mesh/textured_simple.obj \
+  FoundationPose/demo_data/cup0708/mesh/textured_simple_lod3.obj \
+  --target-triangles 7000

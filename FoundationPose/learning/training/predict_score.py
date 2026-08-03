@@ -206,8 +206,11 @@ class ScorePredictor:
     model_name = 'model_best.pth'
     code_dir = os.path.dirname(os.path.realpath(__file__))
     ckpt_dir = f'{code_dir}/../../weights/{self.run_name}/{model_name}'
+    config_path = f'{code_dir}/../../weights/{self.run_name}/config.yml'
+    self.checkpoint_path = os.path.abspath(ckpt_dir)
+    self.config_path = os.path.abspath(config_path)
 
-    self.cfg = OmegaConf.load(f'{code_dir}/../../weights/{self.run_name}/config.yml')
+    self.cfg = OmegaConf.load(config_path)
 
     self.cfg['ckpt_dir'] = ckpt_dir
     self.cfg['enable_amp'] = True
@@ -252,6 +255,8 @@ class ScorePredictor:
     self.model.fuse_conv_batchnorm()
     self.model.to(memory_format=torch.channels_last)
     self.last_timing = {}
+    self.last_raw_score_logits = None
+    self.last_score_backend = None
     self.network_input_capture = NetworkInputCapture('scorer', network_input_capture)
     self._configure_tensorrt(tensorrt_backend, ckpt_dir)
     logging.info("init done")
@@ -378,6 +383,8 @@ class ScorePredictor:
     deferred_cuda_timing_events = []
     network_forward_events = []
     output_convert_events = []
+    self.last_raw_score_logits = None
+    self.last_score_backend = None
     torch.cuda.synchronize()
     total_start = time.perf_counter()
     ob_in_cams = torch.as_tensor(ob_in_cams, dtype=torch.float, device='cuda')
@@ -459,16 +466,19 @@ class ScorePredictor:
     pose_data_iter = pose_data
     global_ids = torch.arange(len(ob_in_cams), device='cuda', dtype=torch.long)
     scores_global = torch.zeros((len(ob_in_cams)), dtype=torch.float, device='cuda')
+    raw_scores_global = torch.full((len(ob_in_cams),), torch.nan, dtype=torch.float, device='cuda')
 
     while 1:
       ids, scores = find_best_among_pairs(pose_data_iter)
       if len(ids)==1:
+        raw_scores_global[global_ids] = scores
         scores_global[global_ids] = scores + 100
         break
       global_ids = global_ids[ids]
       pose_data_iter = pose_data.select_by_indices(global_ids)
 
     scores = scores_global
+    self.last_raw_score_logits = raw_scores_global.detach().cpu().numpy().astype(np.float32)
 
     logging.info(f'forward done')
 
@@ -510,6 +520,7 @@ class ScorePredictor:
       )
       timing['other'] = max(0.0, timing['total'] - sum(timing[key] for key in top_level_keys))
       timing['network_backend'] = next(iter(network_backends)) if len(network_backends) == 1 else 'mixed'
+      self.last_score_backend = timing['network_backend']
       timing['fallback_reason'] = '; '.join(sorted(fallback_reasons)) or None
       if network_backends == {'tensorrt'}:
         for name in ('encoderA', 'encoderAB', 'self_attention', 'cross_attention', 'linear'):

@@ -1,8 +1,11 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import os
+from pathlib import Path
+import platform
 import sys
 import time
 from dataclasses import dataclass
@@ -32,6 +35,7 @@ from estimater import (  # noqa: E402
 )
 import learning.training.predict_pose_refine as pose_refine_module  # noqa: E402
 import learning.training.predict_score as score_module  # noqa: E402
+from .distillation_capture import DistillationCaptureWriter  # noqa: E402
 
 
 _ORIGINAL_COMPUTE_CROP_WINDOW_TF_BATCH = pose_refine_module.compute_crop_window_tf_batch
@@ -44,6 +48,33 @@ _RENDER_LOD_STAGE_NAMES = {
   "refiner_default",
   "scorer_default",
 }
+
+
+def _sha256_file(path: str | os.PathLike[str]) -> str:
+  digest = hashlib.sha256()
+  with open(path, "rb") as file:
+    for chunk in iter(lambda: file.read(1024 * 1024), b""):
+      digest.update(chunk)
+  return digest.hexdigest()
+
+
+def _artifact_metadata(path: str | os.PathLike[str] | None) -> dict | None:
+  if path is None:
+    return None
+  resolved = Path(path).expanduser().resolve()
+  if not resolved.is_file():
+    return {"path": str(resolved), "exists": False}
+  return {
+      "path": str(resolved),
+      "exists": True,
+      "size_bytes": resolved.stat().st_size,
+      "sha256": _sha256_file(resolved),
+  }
+
+
+def _sha256_json(value: object) -> str:
+  payload = json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+  return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
 
 def _compute_crop_window_tf_batch_float32(*, pts, H, W, poses, K, crop_ratio, out_size, method, mesh_diameter=None):
@@ -178,6 +209,7 @@ class FoundationPoseRealtimeTracker:
       quality_render_mask_reuse_enabled: bool = False,
       render_lod: dict | None = None,
       candidate_pipeline_debug_enabled: bool = False,
+      distillation_capture: dict | None = None,
   ):
     set_logging_format()
     set_seed(0)
@@ -199,6 +231,9 @@ class FoundationPoseRealtimeTracker:
     self.frame_statistics_reuse_enabled = frame_statistics_reuse_enabled
     self.quality_render_mask_reuse_enabled = quality_render_mask_reuse_enabled
     self.candidate_pipeline_debug_enabled = candidate_pipeline_debug_enabled
+    self.distillation_capture_config = dict(distillation_capture or {})
+    self.distillation_capture_enabled = bool(self.distillation_capture_config.get("enabled", False))
+    self.last_distillation_capture = None
     self.axis_prior_filter = axis_prior_filter
     self.axis_prior_model_axis = axis_prior_model_axis
     self.axis_prior_max_angle_deg = axis_prior_max_angle_deg
@@ -278,8 +313,82 @@ class FoundationPoseRealtimeTracker:
         init_min_n_views=self.init_min_n_views,
         init_inplane_step=self.init_inplane_step,
     )
+    self.distillation_writer = DistillationCaptureWriter(
+        self.distillation_capture_config,
+        self._distillation_version_metadata() if self.distillation_capture_enabled else {},
+    )
     self._configure_render_lod()
     self._ensure_estimator_float32()
+
+  def _distillation_version_metadata(self) -> dict:
+    pipeline_config = {
+        "init_strategy": self.init_strategy,
+        "est_refine_iter": self.est_refine_iter,
+        "coarse_refine_iter": self.coarse_refine_iter,
+        "coarse_score_filter": self.coarse_score_filter,
+        "coarse_score_top_k": self.coarse_score_top_k,
+        "fine_refine_iter": self.fine_refine_iter,
+        "fine_top_k": self.fine_top_k,
+        "axis_prior_filter": self.axis_prior_filter,
+        "axis_prior_model_axis": list(self.axis_prior_model_axis),
+        "axis_prior_max_angle_deg": self.axis_prior_max_angle_deg,
+        "axis_prior_min_candidates": self.axis_prior_min_candidates,
+        "axis_prior_max_candidates": self.axis_prior_max_candidates,
+        "axis_prior_min_points": self.axis_prior_min_points,
+        "axis_prior_min_confidence": self.axis_prior_min_confidence,
+        "track_refine_iter": self.track_refine_iter,
+        "skip_redundant_coarse_scorer": self.skip_redundant_coarse_scorer,
+        "refiner_input_sizes": {
+          str(stage): list(size)
+          for stage, size in self.refiner.input_sizes.items()
+        },
+    }
+
+    def engine_metadata(predictor) -> dict:
+      result = {}
+      for key, runner in getattr(predictor, "tensorrt_runners", {}).items():
+        result[str(key)] = {
+            "engine": _artifact_metadata(getattr(runner, "engine_path", None)),
+            "metadata": dict(getattr(runner, "metadata", {}) or {}),
+        }
+      return result
+
+    source_paths = (
+        Path(__file__).resolve(),
+        Path(FOUNDATIONPOSE_DIR) / "estimater.py",
+        Path(FOUNDATIONPOSE_DIR) / "learning/models/refine_network.py",
+        Path(FOUNDATIONPOSE_DIR) / "learning/training/predict_pose_refine.py",
+        Path(FOUNDATIONPOSE_DIR) / "learning/training/predict_score.py",
+        Path(__file__).with_name("distillation_capture.py").resolve(),
+    )
+    return {
+        "pipeline_config": pipeline_config,
+        "pipeline_config_sha256": _sha256_json(pipeline_config),
+        "mesh": _artifact_metadata(self.mesh_file),
+        "refiner": {
+          "run_name": self.refiner.run_name,
+          "checkpoint": _artifact_metadata(self.refiner.checkpoint_path),
+          "config": _artifact_metadata(self.refiner.config_path),
+          "tensorrt_engines": engine_metadata(self.refiner),
+        },
+        "scorer": {
+          "run_name": self.scorer.run_name,
+          "checkpoint": _artifact_metadata(self.scorer.checkpoint_path),
+          "config": _artifact_metadata(self.scorer.config_path),
+          "tensorrt_engines": engine_metadata(self.scorer),
+        },
+        "implementation": {
+          path.relative_to(REPO_ROOT).as_posix(): _artifact_metadata(path)
+          for path in source_paths
+        },
+        "environment": {
+          "python": platform.python_version(),
+          "platform": platform.platform(),
+          "torch": torch.__version__,
+          "torch_cuda": torch.version.cuda,
+          "cuda_device": torch.cuda.get_device_name(0) if torch.cuda.is_available() else None,
+        },
+    }
 
   def _configure_render_lod(self) -> None:
     if not self.render_lod_requested:
@@ -524,7 +633,7 @@ class FoundationPoseRealtimeTracker:
     self.last_pose = None
     self.estimator.pose_last = None
 
-  def register(self, color: np.ndarray, depth: np.ndarray, K: np.ndarray, mask: np.ndarray) -> PoseResult:
+  def register(self, color: np.ndarray, depth: np.ndarray, K: np.ndarray, mask: np.ndarray, frame_id: int | None = None, timestamp: float | None = None, object_id: object | None = None, sequence_id: object | None = None, capture_source: str = "runtime") -> PoseResult:
     color, depth, K = self._prepare_frame_inputs(color, depth, K)
     mask = self._valid_mask(mask, depth)
     pose = self.estimator.register(
@@ -550,7 +659,18 @@ class FoundationPoseRealtimeTracker:
         axis_prior_debug=self.axis_prior_visualization_enabled,
         frame_statistics_reuse_enabled=self.frame_statistics_reuse_enabled,
         candidate_pipeline_debug_enabled=self.candidate_pipeline_debug_enabled,
+        distillation_capture_enabled=self.distillation_capture_enabled,
     )
+    self.last_distillation_capture = self.distillation_writer.write_group(
+        getattr(self.estimator, "last_distillation_group", None),
+        frame_id=frame_id,
+        timestamp=timestamp,
+        object_id=object_id if object_id is not None else os.path.basename(self.mesh_file),
+        sequence_id=sequence_id,
+        source=capture_source,
+    )
+    if self.distillation_writer.last_error is not None:
+      logging.warning(f"Distillation group was not saved: {self.distillation_writer.last_error}")
     if self.axis_prior_visualization_enabled:
       try:
         self._save_axis_prior_visualization(color, K, mask)

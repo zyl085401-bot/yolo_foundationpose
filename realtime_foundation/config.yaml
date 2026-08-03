@@ -92,6 +92,18 @@ foundationpose:
     output_dir: realtime_foundation/outputs/network_input_capture
     max_samples_per_signature: 1
 
+  # Final Scorer蒸馏候选组采集。默认关闭；开启后只旁路写数据，最终Pose仍由Legacy Scorer决定。
+  # 共享Feature通过额外PyTorch Encoder前向提取，不替换当前Refiner TensorRT输出。
+  distillation_capture:
+    enabled: false
+    output_dir: realtime_foundation/outputs/distillation_capture
+    expected_candidate_count: 5
+    max_groups: 200
+    stride: 1
+    strict: false
+    feature_version: refinenet_ab_mean_v1
+    sequence_id: null
+
   # 生产路径关闭每次TensorRT调用后的CPU级全GPU同步；Refiner/Scorer函数边界仍保留同步。
   network_internal_sync_enabled: false
 
@@ -104,7 +116,7 @@ foundationpose:
   # 网络渲染LOD总开关。关闭时所有阶段继续使用原Mesh；开启失败时自动回退原Mesh。
   # 原Mesh始终用于中心/直径/点云/BBox/Pose坐标系、注册质量门和最终轮廓显示。
   render_lod:
-    enabled: false
+    enabled: true
     mesh_file: FoundationPose/demo_data/cup0708/mesh/textured_simple_lod1.obj
     stages:
       refiner_coarse: true

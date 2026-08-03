@@ -164,8 +164,11 @@ class PoseRefinePredictor:
     model_name = 'model_best.pth'
     code_dir = os.path.dirname(os.path.realpath(__file__))
     ckpt_dir = f'{code_dir}/../../weights/{self.run_name}/{model_name}'
+    config_path = f'{code_dir}/../../weights/{self.run_name}/config.yml'
+    self.checkpoint_path = os.path.abspath(ckpt_dir)
+    self.config_path = os.path.abspath(config_path)
 
-    self.cfg = OmegaConf.load(f'{code_dir}/../../weights/{self.run_name}/config.yml')
+    self.cfg = OmegaConf.load(config_path)
 
     self.cfg['ckpt_dir'] = ckpt_dir
     self.cfg['enable_amp'] = True
@@ -227,6 +230,7 @@ class PoseRefinePredictor:
     logging.info("init done")
     self.last_trans_update = None
     self.last_rot_update = None
+    self.last_distillation_data = None
     self.last_timing = {}
     self.network_input_capture = NetworkInputCapture('refiner', network_input_capture)
     self._configure_tensorrt(tensorrt_backend, ckpt_dir)
@@ -320,7 +324,7 @@ class PoseRefinePredictor:
     )
 
 
-  def _run_network(self, A, B, network_stage):
+  def _run_network(self, A, B, network_stage, capture_shared_feature=False):
     candidate_count = int(A.shape[0])
     detail = {
         'layout_convert': 0.0,
@@ -362,6 +366,10 @@ class PoseRefinePredictor:
             detail['_deferred_cuda_timing_events'] += (
                 ('tensorrt_execute', tensorrt_events[0], tensorrt_events[1]),
             )
+        if capture_shared_feature:
+          with torch.cuda.amp.autocast(enabled=self.amp):
+            output['shared_feature'] = self.model.extract_shared_feature(A, B)
+          torch.cuda.synchronize()
         return output, 'tensorrt', None, detail
       except Exception as error:
         fallback_reason = f'TensorRT runtime failed: {type(error).__name__}: {error}'
@@ -378,13 +386,15 @@ class PoseRefinePredictor:
 
     with torch.cuda.amp.autocast(enabled=self.amp):
       output = self.model(A, B)
+      if capture_shared_feature:
+        output['shared_feature'] = self.model.extract_shared_feature(A, B)
     torch.cuda.synchronize()
     detail.update(self.model.collect_last_cuda_timing())
     return output, 'pytorch', fallback_reason, detail
 
 
   @torch.inference_mode()
-  def predict(self, rgb, depth, K, ob_in_cams, xyz_map, normal_map=None, get_vis=False, mesh=None, mesh_tensors=None, glctx=None, mesh_diameter=None, iteration=5, network_stage='refiner', capture_iteration_poses=False):
+  def predict(self, rgb, depth, K, ob_in_cams, xyz_map, normal_map=None, get_vis=False, mesh=None, mesh_tensors=None, glctx=None, mesh_diameter=None, iteration=5, network_stage='refiner', capture_iteration_poses=False, capture_distillation_data=False):
     '''
     @rgb: np array (H,W,3)
     @ob_in_cams: np array (N,4,4)
@@ -407,6 +417,8 @@ class PoseRefinePredictor:
 
     B_in_cams = torch.as_tensor(ob_centered_in_cams, device='cuda', dtype=torch.float)
     self.last_iteration_poses = []
+    self.last_distillation_data = None
+    distillation_iterations = [] if capture_distillation_data else None
 
 
     if mesh_tensors is None:
@@ -450,6 +462,13 @@ class PoseRefinePredictor:
     total_start = time.perf_counter()
 
     for iteration_index in range(iteration):
+      poses_before_iteration = B_in_cams.detach().clone() if capture_distillation_data else None
+      raw_trans_batches = []
+      raw_rot_batches = []
+      trans_delta_batches = []
+      rot_delta_batches = []
+      shared_feature_batches = []
+      iteration_backends = []
       logging.info("making cropped data")
       pose_data = make_crop_data_batch(stage_input_size, B_in_cams, mesh_centered, rgb_tensor, depth_tensor, K, crop_ratio=crop_ratio, normal_map=normal_map, xyz_map=xyz_map_tensor, cfg=self.cfg, glctx=glctx, mesh_tensors=mesh_tensors, dataset=self.dataset, mesh_diameter=mesh_diameter, timing=timing)
       B_in_cams = []
@@ -463,9 +482,19 @@ class PoseRefinePredictor:
 
         logging.info("forward start")
         stage_start = start_cuda_stage_timing(timing)
-        output, network_backend, fallback_reason, network_detail = self._run_network(A, B, network_stage)
+        output, network_backend, fallback_reason, network_detail = self._run_network(
+          A,
+          B,
+          network_stage,
+          capture_shared_feature=capture_distillation_data,
+        )
         finish_cuda_stage_timing(timing, 'network_forward', stage_start)
         network_backends.add(network_backend)
+        if capture_distillation_data:
+          iteration_backends.append(network_backend)
+          raw_trans_batches.append(output['trans'].detach().float())
+          raw_rot_batches.append(output['rot'].detach().float())
+          shared_feature_batches.append(output['shared_feature'].detach().float())
         if fallback_reason:
           fallback_reasons.add(fallback_reason)
         deferred_cuda_timing_events.extend(
@@ -530,6 +559,10 @@ class PoseRefinePredictor:
         if self.cfg['normalize_xyz']:
           trans_delta *= (mesh_diameter/2)
 
+        if capture_distillation_data:
+          trans_delta_batches.append(trans_delta.detach().float())
+          rot_delta_batches.append(rot_mat_delta.detach().float())
+
         B_in_cam = egocentric_delta_pose_to_pose(pose_data.poseA[b:b+bs], trans_delta=trans_delta, rot_mat_delta=rot_mat_delta)
         B_in_cams.append(B_in_cam)
         finish_cuda_stage_timing(timing, 'pose_update', stage_start)
@@ -537,10 +570,30 @@ class PoseRefinePredictor:
       B_in_cams = torch.cat(B_in_cams, dim=0).reshape(len(ob_in_cams),4,4)
       if capture_iteration_poses:
         self.last_iteration_poses.append(B_in_cams.detach().cpu().numpy().astype(np.float32))
+      if capture_distillation_data:
+        distillation_iterations.append({
+            'iteration': int(iteration_index + 1),
+            'poses_before': poses_before_iteration.detach().cpu().numpy().astype(np.float32),
+            'poses_after': B_in_cams.detach().cpu().numpy().astype(np.float32),
+            'raw_trans': torch.cat(raw_trans_batches, dim=0).cpu().numpy().astype(np.float32),
+            'raw_rot': torch.cat(raw_rot_batches, dim=0).cpu().numpy().astype(np.float32),
+            'trans_applied': torch.cat(trans_delta_batches, dim=0).cpu().numpy().astype(np.float32),
+            'rot_applied': torch.cat(rot_delta_batches, dim=0).cpu().numpy().astype(np.float32),
+            'shared_feature': torch.cat(shared_feature_batches, dim=0).cpu().numpy().astype(np.float32),
+            'network_backend': iteration_backends[0] if len(set(iteration_backends)) == 1 else 'mixed',
+            'input_size': np.asarray(stage_input_size, dtype=np.int32),
+        })
 
     B_in_cams_out = B_in_cams@torch.tensor(tf_to_center[None], device='cuda', dtype=torch.float)
     self.last_trans_update = trans_delta
     self.last_rot_update = rot_mat_delta
+    if capture_distillation_data:
+      self.last_distillation_data = {
+          'feature_version': 'refinenet_ab_mean_v1',
+          'network_stage': str(network_stage),
+          'candidate_count': int(len(ob_in_cams)),
+          'iterations': distillation_iterations,
+      }
     torch.cuda.synchronize()
     for name, start_event, end_event in deferred_cuda_timing_events:
       timing[name] += start_event.elapsed_time(end_event) / 1000.0

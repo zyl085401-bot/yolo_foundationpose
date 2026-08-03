@@ -576,6 +576,15 @@ def build_tracker(tracker_cfg: dict, candidate_pipeline_debug_enabled: bool = Fa
       quality_render_mask_reuse_enabled=bool(tracker_cfg.get("quality_render_mask_reuse_enabled", False)),
       render_lod=resolve_render_lod_config(tracker_cfg),
       candidate_pipeline_debug_enabled=bool(candidate_pipeline_debug_enabled),
+      distillation_capture={
+          **dict(tracker_cfg.get("distillation_capture", {}) or {}),
+          "output_dir": resolve_path(
+              dict(tracker_cfg.get("distillation_capture", {}) or {}).get(
+                  "output_dir",
+                  "realtime_foundation/outputs/distillation_capture",
+              )
+          ),
+      },
   )
 
 
@@ -1541,7 +1550,16 @@ def main() -> None:
           try:
             register_start_unix_ns = time.time_ns()
             register_start = time.perf_counter()
-            pose_result = tracker.register(color, depth, K, detection.mask)
+            pose_result = tracker.register(
+              color,
+              depth,
+              K,
+              detection.mask,
+              frame_id=frame_index,
+              timestamp=processed_timestamp,
+              object_id=getattr(detection, "class_id", None),
+              capture_source="runtime",
+            )
             register_wall_time = time.perf_counter() - register_start
             register_end_unix_ns = time.time_ns()
           except Exception as exc:

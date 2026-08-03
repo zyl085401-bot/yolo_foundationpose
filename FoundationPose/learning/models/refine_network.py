@@ -138,6 +138,16 @@ class RefineNet(nn.Module):
     return output
 
 
+  def extract_shared_feature(self, A, B):
+    """Return the mean-pooled shared tokens without changing pose-head outputs."""
+    bs = A.shape[0]
+    x = self.encodeA(torch.cat([A, B], dim=0))
+    ab = torch.cat((x[:bs], x[bs:]), 1).contiguous(memory_format=torch.channels_last)
+    ab = self.encodeAB(ab)
+    ab = self.pos_embed(ab.reshape(bs, ab.shape[1], -1).permute(0, 2, 1))
+    return ab.mean(dim=1)
+
+
   def collect_last_cuda_timing(self):
     """Return synchronized CUDA module timings in seconds."""
     return {

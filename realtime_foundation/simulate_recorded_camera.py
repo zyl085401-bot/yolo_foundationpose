@@ -569,7 +569,16 @@ def main() -> None:
       raise RuntimeError(f"replay input rejected before register: {validation_reject_reason}")
     tracker.reset()
     start = time.perf_counter()
-    pose_result = tracker.register(frame.color, frame.depth, frame.K, mask.mask)
+    pose_result = tracker.register(
+      frame.color,
+      frame.depth,
+      frame.K,
+      mask.mask,
+      frame_id=frame.frame_id,
+      timestamp=frame.timestamp,
+      sequence_id=os.path.basename(input_path),
+      capture_source="recorded_replay",
+    )
     elapsed = time.perf_counter() - start
     new_pose = np.asarray(pose_result.pose, dtype=np.float32).reshape(4, 4)
     translation_error = float(np.linalg.norm(new_pose[:3, 3] - publisher.saved_output_pose[:3, 3]))
